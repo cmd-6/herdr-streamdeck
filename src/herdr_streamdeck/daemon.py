@@ -32,7 +32,7 @@ import asyncio
 import contextlib
 import logging
 import signal
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol
@@ -59,17 +59,63 @@ from .summary import build as build_summariser
 
 logger = logging.getLogger("herdr_streamdeck")
 
-# Global subscriptions only -- see the module docstring.
-SUBSCRIPTIONS = (
-    "pane.created",
-    "pane.closed",
-    "pane.updated",
-    "pane.focused",
-    "pane.exited",
-    "pane.agent_detected",
-    "workspace.focused",
-    "tab.focused",
+# Events that can change *which* pane sits where, as opposed to merely
+# restyling one. These trigger a re-read of herdr's ordering, since neither
+# workspace order nor split-tree order can be derived from a pane record.
+STRUCTURAL_EVENTS = frozenset(
+    {
+        "pane.created",
+        "pane.closed",
+        "pane.exited",
+        "pane.moved",
+        "pane.agent_detected",
+        "tab.created",
+        "tab.closed",
+        "tab.moved",
+        "workspace.created",
+        "workspace.closed",
+        "workspace.moved",
+        "workspace.reordered",
+        "workspace.focused",
+        "layout.updated",
+    }
 )
+
+OPTIONAL_SUBSCRIPTIONS = ("workspace.reordered",)
+"""Structural kinds that older servers reject outright.
+
+herdr validates ``events.subscribe`` as a whole: one unrecognised kind fails
+the entire call, so subscribing blindly to a kind the server has never heard of
+leaves the daemon with *no* events -- a dead deck, not a degraded one. herdr
+0.7.5 answers `unknown variant `workspace.reordered`` and subscribes to
+nothing at all. So the server is asked first; see
+HerdrSession.supports_subscription.
+
+Version numbers are no help here: ``workspace.reordered`` was added while
+PROTOCOL_VERSION was already 18 and shipped in 19, so the number does not
+say whether a given server has it. Asking does.
+
+It accompanies ``workspace.move_block``, herdr 0.8.0's atomic worktree-group
+reorder and what a sidebar drag uses for a workspace inside a worktree group.
+Unlike ``workspace.move`` it shifts nothing else, so without this a reorder
+reaches us as nothing at all."""
+
+COSMETIC_SUBSCRIPTIONS = ("pane.updated", "pane.focused", "tab.focused")
+"""Restyle one key in place; no re-read needed."""
+
+SUBSCRIPTIONS = tuple(
+    sorted((STRUCTURAL_EVENTS - set(OPTIONAL_SUBSCRIPTIONS)) | set(COSMETIC_SUBSCRIPTIONS))
+)
+"""Derived, not listed, so the two cannot drift apart.
+
+Classifying a kind as structural is worthless unless something subscribes to
+it, and that gap is invisible: the deck simply catches up on the next reconcile
+instead of at once. Two kinds sat in STRUCTURAL_EVENTS unsubscribed for a long
+time this way. ``workspace.moved`` was hidden because moving a single workspace
+also shifts the focused one, so ``workspace.focused`` arrived instead; and
+closing a tab or workspace removes its panes **without emitting
+``pane.closed``** -- measured, not assumed -- so the deck kept drawing keys for
+panes that no longer existed."""
 
 # Drawn as a dot in the top-right, so the key field itself stays neutral.
 STATUS_COLORS: dict[str, RGB] = {
@@ -137,27 +183,6 @@ ANIMATION_FPS = 20
 A 15-key refresh measured 25 ms (1.34 ms a key), so 20 fps leaves ample
 headroom even in the worst case where every key animates -- and writes are
 skipped when the level is unchanged, so the usual cost is far lower."""
-
-# Events that can change *which* pane sits where, as opposed to merely
-# restyling one. These trigger a re-read of herdr's ordering, since neither
-# workspace order nor split-tree order can be derived from a pane record.
-STRUCTURAL_EVENTS = frozenset(
-    {
-        "pane.created",
-        "pane.closed",
-        "pane.exited",
-        "pane.moved",
-        "pane.agent_detected",
-        "tab.created",
-        "tab.closed",
-        "tab.moved",
-        "workspace.created",
-        "workspace.closed",
-        "workspace.moved",
-        "workspace.focused",
-        "layout.updated",
-    }
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,6 +262,8 @@ class HerdrLike(Protocol):
 
     async def subscribe(self, subscriptions: Sequence[JSONObject]) -> None: ...
 
+    async def supports_subscription(self, kind: str) -> bool: ...
+
     async def resubscribe(self, subscriptions: Sequence[JSONObject]) -> None: ...
 
     def events(self) -> AsyncIterator[Event]: ...
@@ -290,6 +317,10 @@ class DeckController:
         # False from the moment a write fails until the device is reacquired.
         self._connected = True
         self._reconnect_task: asyncio.Task[None] | None = None
+        # Resolved once against the running server, which cannot change
+        # version underneath a live connection.
+        self._optional_subscriptions = True
+        self._optional_checked = False
 
     @property
     def grid(self) -> Grid:
@@ -824,19 +855,44 @@ class DeckController:
 
         return order, focused
 
-    def _subscription_set(self) -> list[JSONObject]:
+    def _subscription_set(self, *, optional: bool = True) -> list[JSONObject]:
         """Global subscriptions plus one status subscription per live pane."""
-        subs = [subscription(kind) for kind in SUBSCRIPTIONS]
+        kinds = (*SUBSCRIPTIONS, *OPTIONAL_SUBSCRIPTIONS) if optional else SUBSCRIPTIONS
+        subs = [subscription(kind) for kind in kinds]
         subs.extend(
             subscription("pane.agent_status_changed", pane_id=pane_id)
             for pane_id in self._panes
         )
         return subs
 
+    async def _install_subscriptions(
+        self, send: Callable[[Sequence[JSONObject]], Awaitable[None]]
+    ) -> None:
+        """Subscribe, leaving out the kinds this server does not recognise.
+
+        Asked before subscribing rather than discovered by failing: an unknown
+        kind rejects the whole set, and the connection is spent by the attempt,
+        so there is nothing left to retry on. See
+        HerdrSession.supports_subscription.
+        """
+        if self._optional_subscriptions and not self._optional_checked:
+            self._optional_checked = True
+            for kind in OPTIONAL_SUBSCRIPTIONS:
+                if not await self._client.supports_subscription(kind):
+                    self._optional_subscriptions = False
+                    logger.info(
+                        "this herdr does not know %s, so it is left out. "
+                        "Workspace reordering will reach the deck on the next "
+                        "reconcile rather than at once",
+                        kind,
+                    )
+                    break
+        await send(self._subscription_set(optional=self._optional_subscriptions))
+
     async def run_subscriptions(self) -> None:
         """Establish the initial subscription set (globals plus per pane)."""
         await self.prime()
-        await self._client.subscribe(self._subscription_set())
+        await self._install_subscriptions(self._client.subscribe)
 
     async def prime(self) -> None:
         """Re-read herdr's arrangement. Snapshot and listing are the truth.
@@ -857,7 +913,7 @@ class DeckController:
 
         # Status subscriptions are per pane, so the set has to follow the panes.
         if set(self._panes) != before:
-            await self._client.resubscribe(self._subscription_set())
+            await self._install_subscriptions(self._client.resubscribe)
 
         self.repaint()
 
@@ -913,7 +969,7 @@ class DeckController:
         # Order matters: subscribe first so no live change is missed, then
         # throw away the replayed backlog, then snapshot. Snapshotting before
         # the backlog drains would just be overwritten by stale events.
-        await self._client.subscribe(self._subscription_set())
+        await self._install_subscriptions(self._client.subscribe)
         await self.drain_replay()
         await self.prime()
 

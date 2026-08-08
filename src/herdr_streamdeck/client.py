@@ -31,6 +31,7 @@ from .protocol import (
     Response,
     decode_message,
     encode_request,
+    subscription,
 )
 
 DEFAULT_EVENT_QUEUE_SIZE = 1024
@@ -355,6 +356,27 @@ class HerdrSession:
     async def subscribe(self, subscriptions: Sequence[JSONObject]) -> None:
         self._subscriptions = list(subscriptions)
         await self._stream.subscribe(self._subscriptions)
+
+    async def supports_subscription(self, kind: str) -> bool:
+        """Whether this server recognises an event kind, asked on a spare line.
+
+        Necessary because the obvious approach does not work. The server
+        validates ``events.subscribe`` as a unit, so one kind it does not know
+        rejects the whole set and leaves the daemon with no events at all --
+        and the connection is spent either way, since herdr serves one request
+        per connection. A rejected set therefore cannot be retried on the
+        stream it was rejected on; by then there is no stream.
+
+        So the question is asked first, on a connection opened and closed for
+        the purpose, before the real subscription set is built.
+        """
+        try:
+            await self.request("events.subscribe", {"subscriptions": [subscription(kind)]})
+        except HerdrError as exc:
+            if exc.code == "invalid_request":
+                return False
+            raise
+        return True
 
     async def resubscribe(self, subscriptions: Sequence[JSONObject]) -> None:
         """Replace the subscription set, reopening the stream to do it.

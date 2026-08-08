@@ -13,8 +13,10 @@ import pytest
 
 from herdr_streamdeck.daemon import (
     HOLD_SECONDS,
+    OPTIONAL_SUBSCRIPTIONS,
     STATUS_COLORS,
     STRUCTURAL_EVENTS,
+    SUBSCRIPTIONS,
     DeckController,
     ReplyMenu,
     _iter_panes,
@@ -64,6 +66,10 @@ class StubClient:
         self.subscriptions: list[JSONObject] = []
         self.resubscribes = 0
         self.pane_text = "agent output"
+        # Event kinds this stand-in server pretends not to recognise, so the
+        # older-herdr path can be exercised without an older herdr.
+        self.unsupported: set[str] = set()
+        self.capability_probes: list[str] = []
 
     async def request(self, method: str, params: JSONObject | None = None) -> JSONObject:
         self.requests.append((method, params))
@@ -85,6 +91,10 @@ class StubClient:
 
     async def subscribe(self, subscriptions: Sequence[JSONObject]) -> None:
         self.subscriptions = list(subscriptions)
+
+    async def supports_subscription(self, kind: str) -> bool:
+        self.capability_probes.append(kind)
+        return kind not in self.unsupported
 
     async def resubscribe(self, subscriptions: Sequence[JSONObject]) -> None:
         self.subscriptions = list(subscriptions)
@@ -1317,3 +1327,73 @@ async def test_the_lock_loop_follows_the_watcher() -> None:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+
+
+# ------------------------------------------------------------- subscription set
+
+
+async def test_every_structural_event_is_actually_subscribed() -> None:
+    """Classifying an event as structural is useless if it never arrives.
+
+    This invariant is what the reorder and close gaps both violated: the kinds
+    were in STRUCTURAL_EVENTS, nothing subscribed to them, and the deck only
+    caught up on the next reconcile.
+    """
+    subscribed = set(SUBSCRIPTIONS) | set(OPTIONAL_SUBSCRIPTIONS)
+    missing = sorted(STRUCTURAL_EVENTS - subscribed)
+    assert not missing, f"structural but never delivered: {missing}"
+
+
+async def test_a_newer_herdr_gets_the_optional_kinds() -> None:
+    controller, _, client = make_controller(snapshot={"panes": [pane_record("w1:p1")]})
+    await controller.run_subscriptions()
+
+    kinds = {s["type"] for s in client.subscriptions if "type" in s}
+    assert "workspace.reordered" in kinds
+    assert client.capability_probes == list(OPTIONAL_SUBSCRIPTIONS)
+
+
+async def test_an_older_herdr_gets_everything_else() -> None:
+    """0.7.5 rejects the whole batch over one unknown kind, leaving no events.
+
+    So the deck must come up fully subscribed to what that server does know,
+    not fail and not fall back to nothing.
+    """
+    controller, _, client = make_controller(snapshot={"panes": [pane_record("w1:p1")]})
+    client.unsupported = {"workspace.reordered"}
+
+    await controller.run_subscriptions()
+
+    kinds = {s["type"] for s in client.subscriptions if "type" in s}
+    assert "workspace.reordered" not in kinds
+    assert set(SUBSCRIPTIONS) <= kinds, "everything else still subscribed"
+    assert any(s.get("pane_id") for s in client.subscriptions), "per-pane status kept"
+
+
+async def test_the_server_is_asked_once_not_per_resubscribe() -> None:
+    """herdr cannot change version under a live connection, so once is enough."""
+    controller, _, client = make_controller(snapshot={"panes": [pane_record("w1:p1")]})
+    client.unsupported = {"workspace.reordered"}
+
+    await controller.run_subscriptions()
+    client._snapshot = {"panes": [pane_record("w1:p1"), pane_record("w1:p2")]}
+    await controller.prime()
+    await controller.prime()
+
+    assert client.capability_probes == list(OPTIONAL_SUBSCRIPTIONS)
+    assert client.resubscribes >= 1, "the pane set changed, so it resubscribed"
+    kinds = {s["type"] for s in client.subscriptions if "type" in s}
+    assert "workspace.reordered" not in kinds, "the answer stuck"
+
+
+async def test_a_reorder_rebuilds_the_columns() -> None:
+    """The event carries no ordering, so it has to trigger a re-read."""
+    controller, _, _ = make_controller(snapshot={"panes": [pane_record("w1:p1")]})
+    await controller.prime()
+    controller._restructure = False
+
+    controller.handle(
+        Event(kind="workspace.reordered", raw_kind="workspace_reordered", data={})
+    )
+
+    assert controller._restructure is True

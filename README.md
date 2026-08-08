@@ -3,7 +3,7 @@
 [![CI](https://github.com/thomas-schweich/herdr-streamdeck/actions/workflows/ci.yml/badge.svg)](https://github.com/thomas-schweich/herdr-streamdeck/actions/workflows/ci.yml)
 
 Drive an [Elgato Stream Deck](https://www.elgato.com/stream-deck) from
-[herdr](https://github.com/herdr/herdr)'s socket API. One key per agent pane,
+[herdr](https://github.com/herdrdev/herdr)'s socket API. One key per agent pane,
 coloured by agent status; press a key to focus that pane.
 
 Elgato's own software is **not** required — this speaks raw HID directly. On
@@ -12,6 +12,11 @@ macOS it must not be running, since it claims the device exclusively.
 Columns are workspaces in sidebar order, rows are that workspace's panes.
 There is no stored layout: herdr's current arrangement is the source of truth,
 so the deck always matches what the sidebar shows.
+
+Tested against herdr 0.7.5 and 0.8.0. Newer event kinds are asked for before
+they are subscribed to, because herdr validates `events.subscribe` as a batch —
+one kind an older server does not recognise rejects the whole set and leaves
+the deck with no events at all.
 
 ```
   diggy      codex      diggy    herdr-sd

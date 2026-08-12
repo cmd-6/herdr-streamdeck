@@ -34,6 +34,28 @@ physical position.
 Pass `--actions-config PATH` or set `HERDR_STREAMDECK_ACTIONS_CONFIG` to keep
 the file elsewhere. The built-in icon choices currently include `microphone`.
 
+### Virtual deck on macOS
+
+Run with `--virtual` to keep the same live 3x5 layout available without the
+USB device. The daemon publishes the rendered key images to a user-only cache
+and accepts authenticated presses on loopback; the included Hammerspoon canvas
+shows them as a non-activating overlay, so clicking Dictate leaves the app
+underneath focused.
+
+Install [Hammerspoon](https://www.hammerspoon.org/), then load the integration
+from `~/.hammerspoon/init.lua`:
+
+```lua
+herdrStreamDeck = dofile("/path/to/herdr-streamdeck/hammerspoon/herdr-streamdeck.lua")
+```
+
+Start the daemon with `--virtual`, reload Hammerspoon, and press
+`Option-Space` from any Space. Press it again or Escape to dismiss.
+A normal click invokes a key and closes the overlay. Holding a Herdr key keeps
+the overlay open for the reply menu. If a physical Stream Deck is plugged in,
+it mirrors the virtual surface; unplugging it leaves the overlay running, and
+plugging it back in attaches it without restarting the daemon.
+
 Elgato's own software is **not** required — this speaks raw HID directly. On
 macOS it must not be running, since it claims the device exclusively.
 

@@ -1193,6 +1193,7 @@ async def amain(argv: list[str] | None = None) -> int:
     surface = open_surface(
         use_device=not args.no_device,
         serial=args.serial,
+        virtual=args.virtual,
     )
 
     # One reply per row: the overlay is a single column, so asking for more
@@ -1270,6 +1271,14 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--no-device",
         action="store_true",
         help="run against an in-memory surface; no hardware required",
+    )
+    parser.add_argument(
+        "--virtual",
+        action="store_true",
+        help=(
+            "serve a Hammerspoon virtual deck and mirror it to USB whenever a physical "
+            "deck is attached"
+        ),
     )
     parser.add_argument(
         "--mode",

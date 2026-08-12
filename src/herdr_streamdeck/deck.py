@@ -1107,8 +1107,14 @@ def open_surface(
     *,
     use_device: bool = True,
     serial: str | None = None,
+    virtual: bool = False,
 ) -> ButtonSurface:
     """Return a real deck when asked for one, otherwise an in-memory surface."""
     if not use_device:
         return NullSurface()
-    return StreamDeckSurface(serial=serial)
+    physical = StreamDeckSurface(serial=serial)
+    if not virtual:
+        return physical
+    from .hybrid import HybridSurface
+
+    return HybridSurface(physical)

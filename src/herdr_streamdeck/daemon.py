@@ -30,8 +30,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import functools
 import logging
+import platform
 import signal
+import subprocess
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -184,6 +187,19 @@ A 15-key refresh measured 25 ms (1.34 ms a key), so 20 fps leaves ample
 headroom even in the worst case where every key animates -- and writes are
 skipped when the level is unchanged, so the usual cost is far lower."""
 
+ACTIVATE_TIMEOUT = 2.0
+
+
+def activate_application(name: str) -> None:
+    """Bring a named macOS application, and its Space, to the foreground."""
+    subprocess.run(
+        ("open", "-a", name),
+        capture_output=True,
+        text=True,
+        timeout=ACTIVATE_TIMEOUT,
+        check=True,
+    )
+
 
 @dataclass(frozen=True, slots=True)
 class MenuLayout:
@@ -282,12 +298,14 @@ class DeckController:
         summariser: Summariser | None = None,
         lock: LockWatcher | None = None,
         lock_interval: float = POLL_SECONDS,
+        activate: Callable[[], None] | None = None,
     ) -> None:
         self._client = client
         self._surface = surface
         self._mode = mode
         self._lock = lock or NoLock()
         self._lock_interval = lock_interval
+        self._activate = activate
         self._locked = False
         self._summariser = summariser
         self._summaries: dict[str, PaneSummary] = {}
@@ -777,6 +795,17 @@ class DeckController:
             logger.warning("failed to focus %s: %s", pane_id, exc)
         except Exception:
             logger.warning("failed to focus %s", pane_id, exc_info=True)
+        else:
+            if self._activate is None:
+                return
+            try:
+                await asyncio.to_thread(self._activate)
+            except Exception:
+                logger.warning(
+                    "focused %s but failed to activate the configured app",
+                    pane_id,
+                    exc_info=True,
+                )
 
     # --------------------------------------------------------------------- run
 
@@ -1119,6 +1148,10 @@ async def amain(argv: list[str] | None = None) -> int:
     if args.probe:
         return probe_devices()
 
+    if args.activate_app and platform.system() != "Darwin":
+        logger.error("--activate-app is only supported on macOS")
+        return 2
+
     if args.stop:
         stopped = stop_running(args.serial)
         print(f"stopped pid {stopped}" if stopped else "no daemon was running")
@@ -1162,6 +1195,11 @@ async def amain(argv: list[str] | None = None) -> int:
         mode=GroupingMode(args.mode),
         summariser=summariser,
         lock=lock_watcher(enabled=not args.no_screen_lock),
+        activate=(
+            functools.partial(activate_application, args.activate_app)
+            if args.activate_app
+            else None
+        ),
     )
 
     stop = asyncio.Event()
@@ -1223,6 +1261,14 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
             "locked, because the summaries are the agents' own words. No other "
             "platform publishes a lock state to follow, so this changes nothing "
             "off macOS"
+        ),
+    )
+    parser.add_argument(
+        "--activate-app",
+        metavar="NAME",
+        help=(
+            "on macOS, bring this application and its Space to the foreground "
+            "after a key successfully focuses a pane (for example: iTerm)"
         ),
     )
     parser.add_argument(

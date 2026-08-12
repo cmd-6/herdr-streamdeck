@@ -6,6 +6,11 @@ Drive an [Elgato Stream Deck](https://www.elgato.com/stream-deck) from
 [herdr](https://github.com/herdrdev/herdr)'s socket API. One key per agent pane,
 coloured by agent status; press a key to focus that pane.
 
+On macOS, add `--activate-app iTerm` (or another terminal application name) to
+bring that application and its Space to the foreground after the pane is
+focused. It is opt-in so a deck used beside an already-visible Herdr client
+does not steal focus on every press.
+
 Elgato's own software is **not** required — this speaks raw HID directly. On
 macOS it must not be running, since it claims the device exclusively.
 
@@ -179,6 +184,7 @@ real hardware and a live herdr server.
 git clone <this repo> && cd herdr-streamdeck
 uv sync
 uv run herdr-streamdeck                  # with a device
+uv run herdr-streamdeck --activate-app iTerm  # also foreground iTerm on macOS
 uv run herdr-streamdeck --no-device -v   # no hardware required
 ```
 

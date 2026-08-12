@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import subprocess
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -20,6 +21,7 @@ from herdr_streamdeck.daemon import (
     DeckController,
     ReplyMenu,
     _iter_panes,
+    activate_application,
     menu_layout,
     worth_summarising,
 )
@@ -299,6 +301,43 @@ async def test_press_focuses_the_pane_under_that_key() -> None:
     surface.tap(1)  # row 0, column 1 -> first pane of w2
     await asyncio.sleep(0.01)
     assert ("pane.focus", {"pane_id": "w2:p1"}) in client.requests
+
+
+async def test_press_activates_the_configured_app_after_focusing() -> None:
+    activated: list[bool] = []
+    client = StubClient({"panes": [pane_record("w1:p1")]})
+    surface = NullSurface(key_count_=15)
+    controller = DeckController(client, surface, activate=lambda: activated.append(True))
+    controller._loop = asyncio.get_running_loop()
+    surface.set_press_handler(controller._on_press)
+    await controller.prime()
+
+    surface.tap(0)
+    await asyncio.sleep(0.05)
+
+    assert ("pane.focus", {"pane_id": "w1:p1"}) in client.requests
+    assert activated == [True]
+
+
+def test_activate_application_asks_macos_to_foreground_the_named_app(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+
+    def run(command: tuple[str, ...], **options: object) -> subprocess.CompletedProcess[str]:
+        calls.append((command, options))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr("herdr_streamdeck.daemon.subprocess.run", run)
+
+    activate_application("iTerm")
+
+    assert calls == [
+        (
+            ("open", "-a", "iTerm"),
+            {"capture_output": True, "text": True, "timeout": 2.0, "check": True},
+        )
+    ]
 
 
 async def test_release_does_not_focus() -> None:

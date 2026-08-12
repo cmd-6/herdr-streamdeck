@@ -171,6 +171,9 @@ class ButtonFace:
     icon: Path | None = None
     """User-supplied image replacing the glyph. See icons.resolve_override."""
 
+    builtin_icon: str = ""
+    """A package-drawn symbol for a non-Herdr action."""
+
     badge: str = ""
 
     summary: str = ""
@@ -647,6 +650,10 @@ def compose_foreground(size: tuple[int, int], face: ButtonFace) -> ImageLike:
             layer.paste(icon, origin, icon)
             drew_icon = True
 
+    if face.builtin_icon == "microphone":
+        _draw_microphone(draw, width, height, face.mark_color)
+        drew_icon = True
+
     summarised = bool(face.summary)
 
     if face.mark and not drew_icon:
@@ -690,6 +697,31 @@ def compose_foreground(size: tuple[int, int], face: ButtonFace) -> ImageLike:
         )
 
     return layer
+
+
+def _draw_microphone(draw: ImageDrawLike, width: int, height: int, color: RGB) -> None:
+    """Draw a simple microphone that remains legible on a 72px key."""
+    stroke = max(2, round(height * 0.055))
+    left = width * 0.37
+    right = width * 0.63
+    top = height * 0.18
+    bottom = height * 0.57
+    radius = (right - left) * 0.48
+    draw.rounded_rectangle(
+        (left, top, right, bottom),
+        radius=radius,
+        outline=color,
+        width=stroke,
+    )
+    bowl = (width * 0.27, height * 0.32, width * 0.73, height * 0.72)
+    draw.arc(bowl, start=0, end=180, fill=color, width=stroke)
+    stem_x = width / 2
+    draw.line((stem_x, height * 0.72, stem_x, height * 0.81), fill=color, width=stroke)
+    draw.line(
+        (width * 0.39, height * 0.81, width * 0.61, height * 0.81),
+        fill=color,
+        width=stroke,
+    )
 
 
 BORDER_WIDTH = 3

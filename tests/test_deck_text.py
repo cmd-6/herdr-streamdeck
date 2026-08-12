@@ -12,6 +12,8 @@ from PIL import Image, ImageDraw
 
 from herdr_streamdeck.deck import (
     PREVIEW_LINES_PER_ROW,
+    ButtonFace,
+    compose_foreground,
     load_font,
     plan_preview,
 )
@@ -191,3 +193,12 @@ def test_a_leading_space_still_indents() -> None:
     """The margin is a real character, so it still holds its column."""
     left, _ = ink_extent(" MMMMMM", 17)
     assert left > 6, "the margin space collapsed"
+
+
+def test_microphone_icon_is_drawn_without_an_external_image() -> None:
+    alpha = compose_foreground(SIZE, ButtonFace(builtin_icon="microphone")).getchannel("A")
+    bounds = alpha.getbbox()
+
+    assert bounds is not None
+    assert bounds[0] < SIZE[0] / 2 < bounds[2]
+    assert bounds[1] < SIZE[1] / 2 < bounds[3]

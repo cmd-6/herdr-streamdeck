@@ -40,6 +40,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol
 
+from .actions import DeckAction, default_config_path, load_actions, open_action
 from .animation import EMPTY_ANIMATION, Animation, animation_for, frame_index
 from .client import HerdrSession
 from .deck import (
@@ -299,6 +300,8 @@ class DeckController:
         lock: LockWatcher | None = None,
         lock_interval: float = POLL_SECONDS,
         activate: Callable[[], None] | None = None,
+        actions: dict[int, DeckAction] | None = None,
+        action_runner: Callable[[DeckAction], None] = open_action,
     ) -> None:
         self._client = client
         self._surface = surface
@@ -306,6 +309,8 @@ class DeckController:
         self._lock = lock or NoLock()
         self._lock_interval = lock_interval
         self._activate = activate
+        self._actions = actions or {}
+        self._action_runner = action_runner
         self._locked = False
         self._summariser = summariser
         self._summaries: dict[str, PaneSummary] = {}
@@ -413,6 +418,9 @@ class DeckController:
             if index in menu_faces:
                 face = menu_faces[index]
                 # Steady and full: keys you are choosing between must not pulse.
+                animation = EMPTY_ANIMATION
+            elif index in self._actions:
+                face = self._actions[index].face
                 animation = EMPTY_ANIMATION
             else:
                 pane = grid.pane_at(self._columns, index)
@@ -664,6 +672,10 @@ class DeckController:
             self._menu_press(menu, index)
             return
 
+        if index in self._actions:
+            self._holding = index
+            return
+
         pane = self.grid.pane_at(self._columns, index)
         if pane is None:
             logger.debug("key %d pressed but maps to no pane", index)
@@ -705,6 +717,12 @@ class DeckController:
         if self._hold_task is not None:
             self._hold_task.cancel()
             self._hold_task = None
+        action = self._actions.get(index)
+        if action is not None:
+            logger.info("key %d tapped -> %s", index, action.label)
+            task = asyncio.create_task(self._run_action(action), name=f"action-{index}")
+            task.add_done_callback(lambda _: None)
+            return
         # A tap, not a hold. Focus happens on release so the two gestures stay
         # distinguishable -- focusing on press would fire before a hold could
         # be recognised, and every hold would drag you into the pane.
@@ -714,6 +732,12 @@ class DeckController:
         logger.info("key %d tapped -> focusing %s", index, pane.pane_id)
         task = asyncio.create_task(self._focus(pane.pane_id), name=f"focus-{pane.pane_id}")
         task.add_done_callback(lambda _: None)
+
+    async def _run_action(self, action: DeckAction) -> None:
+        try:
+            await asyncio.to_thread(self._action_runner, action)
+        except Exception:
+            logger.warning("action %r failed", action.label, exc_info=True)
 
     async def _hold(self, index: int, pane_id: str) -> None:
         """Open the reply menu if the key stays down long enough."""
@@ -1184,6 +1208,17 @@ async def amain(argv: list[str] | None = None) -> int:
         instance.release()
         raise
 
+    actions_path = Path(args.actions_config) if args.actions_config else default_config_path()
+    try:
+        actions = load_actions(actions_path, key_count=surface.key_count)
+    except ValueError as exc:
+        surface.close()
+        instance.release()
+        logger.error("%s", exc)
+        return 2
+    if actions:
+        logger.info("loaded %d custom action(s) from %s", len(actions), actions_path)
+
     # Two connections -- herdr resets a connection that both subscribes and
     # issues requests. See HerdrSession.
     client = HerdrSession(Path(args.socket) if args.socket else None)
@@ -1200,6 +1235,7 @@ async def amain(argv: list[str] | None = None) -> int:
             if args.activate_app
             else None
         ),
+        actions=actions,
     )
 
     stop = asyncio.Event()
@@ -1261,6 +1297,14 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
             "locked, because the summaries are the agents' own words. No other "
             "platform publishes a lock state to follow, so this changes nothing "
             "off macOS"
+        ),
+    )
+    parser.add_argument(
+        "--actions-config",
+        metavar="PATH",
+        help=(
+            "custom button configuration (default: "
+            "$HERDR_STREAMDECK_ACTIONS_CONFIG or ~/.config/herdr-streamdeck/actions.toml)"
         ),
     )
     parser.add_argument(

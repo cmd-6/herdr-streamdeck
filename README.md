@@ -11,6 +11,29 @@ bring that application and its Space to the foreground after the pane is
 focused. It is opt-in so a deck used beside an already-visible Herdr client
 does not steal focus on every press.
 
+### Custom buttons alongside Herdr
+
+Reserve individual keys for non-Herdr actions in
+`~/.config/herdr-streamdeck/actions.toml`. Unconfigured keys keep following
+Herdr as usual. Keys are numbered left-to-right, top-to-bottom, starting at 1.
+
+```toml
+[[action]]
+key = 15
+label = "Dictate"
+icon = "microphone"
+url = "superwhisper://record"
+```
+
+Every tap opens the URL in the background. For Superwhisper, the official
+`superwhisper://record` URL toggles recording, so one tap starts dictation and
+the next stops it while the application you are dictating into stays in front.
+The configured key replaces any Herdr pane that would otherwise occupy that
+physical position.
+
+Pass `--actions-config PATH` or set `HERDR_STREAMDECK_ACTIONS_CONFIG` to keep
+the file elsewhere. The built-in icon choices currently include `microphone`.
+
 Elgato's own software is **not** required — this speaks raw HID directly. On
 macOS it must not be running, since it claims the device exclusively.
 

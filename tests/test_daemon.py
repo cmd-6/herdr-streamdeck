@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 
+from herdr_streamdeck.actions import DeckAction
 from herdr_streamdeck.daemon import (
     HOLD_SECONDS,
     OPTIONAL_SUBSCRIPTIONS,
@@ -317,6 +318,31 @@ async def test_press_activates_the_configured_app_after_focusing() -> None:
 
     assert ("pane.focus", {"pane_id": "w1:p1"}) in client.requests
     assert activated == [True]
+
+
+async def test_custom_action_reserves_its_key_and_runs_on_every_tap() -> None:
+    action = DeckAction(14, "Dictate", "microphone", "superwhisper://record")
+    invoked: list[DeckAction] = []
+    client = StubClient({"panes": [pane_record("w1:p1")]})
+    surface = NullSurface(key_count_=15)
+    controller = DeckController(
+        client,
+        surface,
+        actions={14: action},
+        action_runner=invoked.append,
+    )
+    controller._loop = asyncio.get_running_loop()
+    surface.set_press_handler(controller._on_press)
+    await controller.prime()
+
+    assert surface.faces[14] == action.face
+
+    surface.tap(14)
+    surface.tap(14)
+    await asyncio.sleep(0.05)
+
+    assert invoked == [action, action]
+    assert all(method != "pane.focus" for method, _ in client.requests)
 
 
 def test_activate_application_asks_macos_to_foreground_the_named_app(

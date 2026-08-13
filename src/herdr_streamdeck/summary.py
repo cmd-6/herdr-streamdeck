@@ -6,44 +6,17 @@ the trip the deck exists to save. So on a status transition the pane's recent
 output is sent to a small model that returns the end state in a few words, plus
 the replies worth having one tap away.
 
-Everything here is measured rather than chosen. Against a 15-key deck the
-constraints are latency (a summary that lands after you have already looked is
-worthless) and reliability (a wrong suggested reply is worse than none), and the
-configuration below is what came out of a bake-off across nine hosted models.
-The same summariser also refreshes active progress at a bounded cadence; the
+This fork uses GPT-5.6 Luna through OpenAI's Responses API. Low reasoning gives
+the model enough room to distinguish several similar active tasks, while a
+strict forced function keeps the tiny display contract deterministic. Chat
+Completions cannot combine Luna function tools with reasoning, so the endpoint
+is part of the configuration rather than an interchangeable implementation
+detail.
+
+The same summariser refreshes active progress at a bounded cadence; the
 controller owns that scheduling and rejects a result if the pane changed state
-while the request was in flight:
-
-* **nemotron-3-ultra**, at 1.05s median / 1.30s p90, 237 prompt tokens. The
-  runners-up: minimax-m3 corrupted JSON into its own string fields 58% of the
-  time, gpt-oss-20b answered a direct question with ``waiting: false`` in 6 of 6
-  trials, and deepseek-v4-flash took 16s.
-* **reasoning off**. ``reasoning_effort="none"`` is 4x faster than ``"low"``
-  (1.05s vs 1.96s) *and* more accurate -- with reasoning on, the model talked
-  itself into offering replies to already-finished work 2 times in 12. The
-  documented ``/no_think`` and ``detailed thinking off`` prompt tags do nothing;
-  only the API parameter works.
-* **a forced tool call, not response_format**. Both conform with reasoning off,
-  but only one of them survives reasoning being on: at ``reasoning_effort="low"``
-  a response schema drops to 7/15, silently omitting ``responses``, where the
-  tool call holds 15/15 at both efforts. On a separate approve/deny classifier
-  the gap was starker still -- 25/25 against 15/25, and the schema's failures
-  clustered on exactly the inputs that mattered. Since ``"none"`` is
-  undocumented and could stop being honoured, the mechanism that does not
-  depend on it is the safer one to ship.
-* **the schema also spelled out in the prompt** (``SHAPE``). This was originally
-  credited with fixing conformance -- declared alone, an earlier schema omitted
-  ``waiting`` from 10 of 15 responses. That does not reproduce against the
-  current schema: with the restatement, with a one-line "reply only with JSON",
-  and with nothing at all, conformance is 20/20. The earlier failure was very
-  likely the old three-field shape rather than the missing prompt copy. SHAPE
-  stays because the retry path needs it to restate the contract, not because it
-  is load-bearing here.
-
-Worth knowing if any of this is ever revisited: ``reasoning_effort="low"``
-breaks structured output on this model -- 7/15, silently dropping ``responses``
--- while a forced tool call conforms 15/15 at both efforts. The fragile
-combination is thinking plus a response schema, not thinking as such.
+while the request was in flight. The schema is also spelled out in the prompt
+because the retry path needs to restate the contract after a malformed answer.
 
 The whole prompt is ours, which is the point: 237 tokens, none of them spent on
 somebody else's sandbox rules.
@@ -64,8 +37,8 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-ENDPOINT = "https://api.fireworks.ai/inference/v1/chat/completions"
-MODEL = "accounts/fireworks/models/nemotron-3-ultra-nvfp4"
+ENDPOINT = "https://api.openai.com/v1/responses"
+MODEL = "gpt-5.6-luna"
 
 TOOL_NAME = "label_pane"
 """The one tool the model is forced to call. See Summariser._body."""
@@ -541,35 +514,20 @@ class Summariser:
         return json.dumps(
             {
                 "model": MODEL,
-                "max_tokens": 1024,
-                "temperature": 0.0,
-                "top_k": 40,
-                "presence_penalty": 0,
-                "frequency_penalty": 0,
-                # Measured at 4x faster and *more* accurate than "low". Not a
-                # documented value for every model on this endpoint, but it is
-                # for this one; others reject it with HTTP 400.
-                "reasoning_effort": "none",
-                # A forced tool call rather than response_format. Both conform
-                # with reasoning off, but the tool call is the sturdier of the
-                # two: at reasoning_effort="low" a response schema drops to
-                # 7/15, silently omitting `responses`, while the tool call held
-                # 15/15 at both efforts and 25/25 on a separate classifier task
-                # where the schema managed 15/25. Since "none" is an
-                # undocumented value that could stop being honoured, the
-                # mechanism that survives reasoning is the safer one to ship.
+                "input": messages,
+                "max_output_tokens": 1024,
+                "reasoning": {"effort": "low"},
+                "store": False,
                 "tools": [
                     {
                         "type": "function",
-                        "function": {
-                            "name": TOOL_NAME,
-                            "description": "Label a pane on the Stream Deck.",
-                            "parameters": self._schema(),
-                        },
+                        "name": TOOL_NAME,
+                        "description": "Label a pane on the Stream Deck.",
+                        "parameters": self._schema(),
+                        "strict": True,
                     }
                 ],
-                "tool_choice": {"type": "function", "function": {"name": TOOL_NAME}},
-                "messages": messages,
+                "tool_choice": {"type": "function", "name": TOOL_NAME},
             }
         ).encode()
 
@@ -592,22 +550,27 @@ class Summariser:
             return None
 
         try:
-            message = json.loads(raw)["choices"][0]["message"]
+            output = json.loads(raw)["output"]
         except Exception:
             logger.warning("could not read summary response", exc_info=True)
             return None
 
-        calls = message.get("tool_calls") or []
-        if calls:
-            arguments = calls[0].get("function", {}).get("arguments")
-            if isinstance(arguments, str):
-                return arguments
-        # Falling back to plain content covers a model that answers in prose
-        # despite being told to call the tool -- which then fails to parse and
-        # goes down the retry path, rather than being mistaken for a transport
-        # failure and abandoned.
-        content = message.get("content")
-        return content if isinstance(content, str) else None
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "function_call" and item.get("name") == TOOL_NAME:
+                arguments = item.get("arguments")
+                if isinstance(arguments, str):
+                    return arguments
+            if item.get("type") != "message":
+                continue
+            for content in item.get("content", []):
+                if not isinstance(content, dict) or content.get("type") != "output_text":
+                    continue
+                text = content.get("text")
+                if isinstance(text, str):
+                    return text
+        return None
 
     async def summarise(self, transcript: str) -> PaneSummary | None:
         """Summarise a pane's recent output. None on any failure at all.
@@ -661,24 +624,31 @@ class Summariser:
 
 
 def api_key(env: dict[str, str] | None = None) -> str | None:
-    """The Fireworks key, from the environment or a .env beside the project.
+    """The OpenAI key, from the environment or a configured env file.
 
     herdr starts plugins itself, so the daemon does not necessarily inherit a
     shell's environment -- reading the file is what makes it work when launched
     as a plugin rather than by hand.
     """
     source = os.environ if env is None else env
-    key = source.get("FIREWORKS_API_KEY")
+    key = source.get("OPENAI_API_KEY")
     if key and key.strip():
         return key.strip()
 
-    for candidate in (os.getcwd(), os.path.dirname(os.path.dirname(__file__))):
-        path = os.path.join(candidate, ".env")
+    configured = source.get("OPENAI_API_KEY_FILE")
+    candidates = [configured] if configured else []
+    candidates.extend(
+        os.path.join(candidate, ".env")
+        for candidate in (os.getcwd(), os.path.dirname(os.path.dirname(__file__)))
+    )
+    for path in candidates:
+        if not path:
+            continue
         try:
             with open(path) as handle:
                 for line in handle:
                     name, _, value = line.strip().partition("=")
-                    if name.strip() == "FIREWORKS_API_KEY":
+                    if name.strip() == "OPENAI_API_KEY":
                         cleaned = value.strip().strip('"').strip("'")
                         if cleaned:
                             return cleaned

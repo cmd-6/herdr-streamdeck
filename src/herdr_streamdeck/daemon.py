@@ -1303,7 +1303,7 @@ async def amain(argv: list[str] | None = None) -> int:
     rows = surface.key_layout[0] or 3
     summariser = None if args.no_summaries else build_summariser(max_replies=rows)
     if summariser is None and not args.no_summaries:
-        logger.info("no FIREWORKS_API_KEY found; running without pane summaries")
+        logger.info("no OPENAI_API_KEY found; running without pane summaries")
 
     try:
         surface.open()
@@ -1397,7 +1397,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         action="store_true",
         help=(
             "skip the three-word pane summaries even if a key is configured. "
-            "They are already skipped when FIREWORKS_API_KEY is absent"
+            "They are already skipped when OPENAI_API_KEY is absent"
         ),
     )
     parser.add_argument(

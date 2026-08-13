@@ -166,8 +166,10 @@ transcript does not say which part is current — without that, a pane holding a
 old question above a newer answer got labelled with the question, and offered
 replies to something nobody was waiting on.
 
-Set `FIREWORKS_API_KEY` (environment or `.env`) to enable it; without a key the
-deck runs exactly as before. `--no-summaries` turns it off explicitly. Every
+Set `OPENAI_API_KEY` (environment or `.env`) to enable GPT-5.6 Luna summaries;
+without a key the deck runs exactly as before. `OPENAI_API_KEY_FILE` may point
+at another env file when the credential is owned by a different project.
+`--no-summaries` turns it off explicitly. Every
 failure — timeout, rate limit, malformed response — degrades to no summary
 rather than a wrong one, and nothing blocks the display on the network.
 
@@ -196,11 +198,10 @@ because the safe reading of "I cannot tell" is the one that hides the
 summaries. `--no-screen-lock` opts out. No other platform publishes a single
 lock state to follow, so nothing changes off macOS.
 
-The model and its settings were chosen by measurement, not preference; see the
-module docstring in `summary.py` for the bake-off. Suggested replies come back
-with each summary and are stored, but nothing sends them yet — committing text
-to a live agent session on a keypress needs an interaction that can't be
-mistapped.
+This fork uses GPT-5.6 Luna through OpenAI's Responses API with low reasoning
+and a strict function schema. Suggested replies come back with each summary and
+are stored, but nothing sends them yet — committing text to a live agent session
+on a keypress needs an interaction that can't be mistapped.
 
 Panes with no detected agent are plain terminals, marked `$_` and fully
 switchable — pressing the key focuses the shell like any other pane. Codex

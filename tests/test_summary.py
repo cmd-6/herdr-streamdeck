@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import urllib.error
+from pathlib import Path
 
 import pytest
 
@@ -48,20 +49,11 @@ def envelope(payload: object) -> bytes:
     """A response shaped the way the model actually answers: a tool call."""
     return json.dumps(
         {
-            "choices": [
+            "output": [
                 {
-                    "message": {
-                        "content": None,
-                        "tool_calls": [
-                            {
-                                "type": "function",
-                                "function": {
-                                    "name": "label_pane",
-                                    "arguments": json.dumps(payload),
-                                },
-                            }
-                        ],
-                    }
+                    "type": "function_call",
+                    "name": "label_pane",
+                    "arguments": json.dumps(payload),
                 }
             ]
         }
@@ -70,7 +62,16 @@ def envelope(payload: object) -> bytes:
 
 def prose_envelope(payload: object) -> bytes:
     """A model that answered in text instead of calling the tool."""
-    return json.dumps({"choices": [{"message": {"content": json.dumps(payload)}}]}).encode()
+    return json.dumps(
+        {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": json.dumps(payload)}],
+                }
+            ]
+        }
+    ).encode()
 
 
 def transport_returning(payload: object) -> Transport:
@@ -209,10 +210,7 @@ async def test_a_summary_round_trips() -> None:
     )
 
 
-async def test_the_request_asks_for_no_reasoning() -> None:
-    """Measured at 4x faster than `low` and more accurate with it. If this ever
-    silently stops being sent, the deck gets slower and starts offering replies
-    to finished work."""
+async def test_the_request_uses_luna_with_low_reasoning() -> None:
     seen: list[dict[str, object]] = []
 
     def send(body: bytes, timeout: float) -> bytes:
@@ -220,16 +218,14 @@ async def test_the_request_asks_for_no_reasoning() -> None:
         return envelope(GOOD)
 
     await Summariser(transport=send).summarise("x")
-    assert seen[0]["reasoning_effort"] == "none"
+    assert seen[0]["reasoning"] == {"effort": "low"}
     assert seen[0]["model"] == MODEL
-    assert seen[0]["temperature"] == 0.0
+    assert seen[0]["store"] is False
+    assert "temperature" not in seen[0]
 
 
 async def test_the_answer_is_forced_through_a_tool_call() -> None:
-    """Both mechanisms conform with reasoning off, but only the tool call
-    survives reasoning being on: a response schema drops to 7/15 there,
-    silently omitting `responses`. Since `reasoning_effort="none"` is an
-    undocumented value, the deck should not depend on it holding."""
+    """Luna supports reasoning plus function tools through the Responses API."""
     seen: list[dict[str, object]] = []
 
     def send(body: bytes, timeout: float) -> bytes:
@@ -238,12 +234,10 @@ async def test_the_answer_is_forced_through_a_tool_call() -> None:
 
     await Summariser(transport=send).summarise("x")
     assert "response_format" not in seen[0]
-    assert seen[0]["tool_choice"] == {
-        "type": "function",
-        "function": {"name": "label_pane"},
-    }
+    assert seen[0]["tool_choice"] == {"type": "function", "name": "label_pane"}
     tools = seen[0]["tools"]
     assert isinstance(tools, list) and len(tools) == 1
+    assert tools[0]["strict"] is True
     for field in ("waiting", "summary", "responses"):
         assert field in SYSTEM_PROMPT, f"{field} is not described in the prompt"
 
@@ -270,7 +264,7 @@ async def test_only_the_tail_of_a_long_transcript_is_sent() -> None:
 
     summariser = Summariser(transport=send, max_chars=100)
     await summariser.summarise("A" * 500 + "TAIL")
-    messages = seen[0]["messages"]
+    messages = seen[0]["input"]
     assert isinstance(messages, list)
     content = messages[1]["content"]
     assert "TAIL" in content
@@ -335,7 +329,14 @@ async def test_a_non_conforming_payload_yields_no_summary() -> None:
 
 
 def test_the_key_comes_from_the_environment() -> None:
-    assert api_key({"FIREWORKS_API_KEY": " fw_secret "}) == "fw_secret"
+    assert api_key({"OPENAI_API_KEY": " openai_secret "}) == "openai_secret"
+
+
+def test_the_key_can_come_from_an_explicit_env_file(tmp_path: Path) -> None:
+    env_file = tmp_path / "v2.env"
+    env_file.write_text("OPENAI_API_KEY='shared_secret'\n")
+
+    assert api_key({"OPENAI_API_KEY_FILE": str(env_file)}) == "shared_secret"
 
 
 def test_no_key_means_no_summariser() -> None:
@@ -344,7 +345,7 @@ def test_no_key_means_no_summariser() -> None:
 
 
 def test_an_explicit_key_builds_a_summariser() -> None:
-    summariser = build(key="fw_test")
+    summariser = build(key="openai_test")
     assert summariser is not None
     assert summariser.timeout > 0
 
@@ -413,7 +414,7 @@ def test_the_reply_count_is_bound_to_the_deck_geometry() -> None:
     asyncio.run(Summariser(transport=send, max_replies=3).summarise("x"))
     tools = seen[0]["tools"]
     assert isinstance(tools, list)
-    schema = tools[0]["function"]["parameters"]
+    schema = tools[0]["parameters"]
     assert schema["properties"]["responses"]["maxItems"] == 3
 
 
@@ -429,7 +430,7 @@ def test_a_taller_deck_may_ask_for_more() -> None:
     asyncio.run(Summariser(transport=send, max_replies=4).summarise("x"))
     tools = seen[0]["tools"]
     assert isinstance(tools, list)
-    assert tools[0]["function"]["parameters"]["properties"]["responses"]["maxItems"] == 4
+    assert tools[0]["parameters"]["properties"]["responses"]["maxItems"] == 4
 
 
 def test_binding_the_count_does_not_mutate_the_shared_schema() -> None:
@@ -467,7 +468,7 @@ async def test_the_retry_says_what_was_wrong_and_restates_the_shape() -> None:
     send, seen = replying({"summary": "no waiting field"}, GOOD)
     await Summariser(transport=send).summarise("x")
 
-    messages = seen[1]["messages"]
+    messages = seen[1]["input"]
     assert isinstance(messages, list)
     assert messages[2]["role"] == "assistant", "the model should see its own answer"
     correction = messages[3]["content"]
@@ -508,7 +509,7 @@ async def test_the_transcript_is_not_resent_on_a_retry() -> None:
     send, seen = replying({"summary": "bad"}, GOOD)
     await Summariser(transport=send).summarise("PANE OUTPUT HERE")
 
-    second = seen[1]["messages"]
+    second = seen[1]["input"]
     assert isinstance(second, list)
     assert sum(1 for m in second if "PANE OUTPUT HERE" in str(m.get("content"))) == 1
 
@@ -606,7 +607,7 @@ async def test_the_summariser_strips_before_sending() -> None:
         return envelope(GOOD)
 
     await Summariser(transport=send).summarise(PROMPT_BOX)
-    messages = seen[0]["messages"]
+    messages = seen[0]["input"]
     assert isinstance(messages, list)
     sent = str(messages[1]["content"])
     assert "kimi" not in sent
@@ -672,7 +673,7 @@ async def test_the_request_points_at_the_end_of_the_scrollback() -> None:
         return envelope(GOOD)
 
     await Summariser(transport=send).summarise(SCROLLBACK)
-    messages = seen[0]["messages"]
+    messages = seen[0]["input"]
     assert isinstance(messages, list)
     sent = str(messages[1]["content"])
 
@@ -744,7 +745,7 @@ async def test_the_request_carries_neither_box_nor_spinner() -> None:
     await Summariser(transport=send).summarise(
         PROMPT_BOX.replace("✻ Brewed for 1m 7s", "✻ Brewed for 1m 7s")
     )
-    messages = seen[0]["messages"]
+    messages = seen[0]["input"]
     assert isinstance(messages, list)
     sent = str(messages[1]["content"])
     assert "Brewed for" not in sent

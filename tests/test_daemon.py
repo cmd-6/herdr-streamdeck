@@ -24,6 +24,7 @@ from herdr_streamdeck.daemon import (
     _iter_panes,
     activate_application,
     menu_layout,
+    working_label,
     worth_summarising,
 )
 from herdr_streamdeck.deck import (
@@ -746,17 +747,107 @@ async def test_blocking_asks_for_a_summary_and_shows_it() -> None:
     assert [r[0] for r in client.requests].count("pane.read") == 1
 
 
-async def test_a_pane_starting_work_is_not_summarised() -> None:
-    """Summaries cost money and a working pane changes constantly."""
+async def test_starting_work_uses_the_terminal_title_without_a_model_call() -> None:
     calls: list[str] = []
-    controller, _, _ = make_controller(snapshot={"panes": [pane_record("w1:p1")]})
+    controller, surface, _ = make_controller(
+        snapshot={
+            "panes": [
+                pane_record(
+                    "w1:p1",
+                    terminal_title_stripped="◑ Review PR #9139 for code simplification",
+                )
+            ]
+        }
+    )
     controller._summariser = summariser_returning(SUMMARY, calls)
     await controller.prime()
 
     controller.handle(status_changed("w1:p1", "working"))
     await asyncio.sleep(0)
-    await asyncio.sleep(0)
+    controller.repaint()
+
     assert calls == []
+    assert surface.faces[0].summary == "PR 9139 simplification"
+
+
+@pytest.mark.parametrize(
+    ("title", "expected"),
+    [
+        ("◑ Review PR #9139 for code simplification", "PR 9139 simplification"),
+        ("Review PR #9029 with thermonuclear code review", "PR 9029 thermonuclear"),
+        ("Review agent steering overhaul PR", "agent steering overhaul"),
+        ("Review PR for correctness and issues", "correctness and issues"),
+    ],
+)
+def test_working_label_keeps_the_words_that_distinguish_similar_tasks(
+    title: str, expected: str
+) -> None:
+    assert working_label(title) == expected
+
+
+async def test_working_progress_is_refreshed_from_the_live_transcript() -> None:
+    calls: list[str] = []
+    controller, surface, _ = make_controller(
+        snapshot={
+            "panes": [
+                pane_record(
+                    "w1:p1",
+                    agent_status="working",
+                    terminal_title_stripped="Review PR #9139",
+                )
+            ]
+        }
+    )
+    controller._summariser = summariser_returning(SUMMARY, calls)
+    await controller.prime()
+
+    controller._refresh_working_summaries()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    controller.repaint()
+
+    assert calls == ["agent output"]
+    assert surface.faces[0].summary == "remove or deprecate"
+    assert controller.replies_for("w1:p1") == (), "busy agents must not offer replies"
+
+    controller._refresh_working_summaries()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert calls == ["agent output"], "unchanged output must not spend another model call"
+
+
+async def test_finishing_cancels_stale_progress_before_summarising_the_result() -> None:
+    started = asyncio.Event()
+    never = asyncio.Event()
+
+    class Sequenced(Summariser):
+        calls = 0
+
+        async def summarise(self, transcript: str) -> PaneSummary | None:
+            self.calls += 1
+            if self.calls == 1:
+                started.set()
+                await never.wait()
+                return PaneSummary("stale progress", False)
+            return PaneSummary("review finished", False)
+
+    controller, surface, _ = make_controller(
+        snapshot={"panes": [pane_record("w1:p1", agent_status="working")]}
+    )
+    controller._summariser = Sequenced(
+        transport=lambda body, timeout: b"transport is not reached"
+    )
+    await controller.prime()
+    controller._refresh_working_summaries()
+    await started.wait()
+
+    controller.handle(status_changed("w1:p1", "idle"))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    controller.repaint()
+
+    assert surface.faces[0].summary == "review finished"
 
 
 async def test_finishing_a_turn_is_summarised() -> None:

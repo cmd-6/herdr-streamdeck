@@ -9,7 +9,10 @@ the replies worth having one tap away.
 Everything here is measured rather than chosen. Against a 15-key deck the
 constraints are latency (a summary that lands after you have already looked is
 worthless) and reliability (a wrong suggested reply is worse than none), and the
-configuration below is what came out of a bake-off across nine hosted models:
+configuration below is what came out of a bake-off across nine hosted models.
+The same summariser also refreshes active progress at a bounded cadence; the
+controller owns that scheduling and rejects a result if the pane changed state
+while the request was in flight:
 
 * **nemotron-3-ultra**, at 1.05s median / 1.30s p90, 237 prompt tokens. The
   runners-up: minimax-m3 corrupted JSON into its own string fields 58% of the

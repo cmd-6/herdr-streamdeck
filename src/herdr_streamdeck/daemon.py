@@ -31,6 +31,7 @@ import argparse
 import asyncio
 import contextlib
 import logging
+import re
 import signal
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
@@ -184,6 +185,32 @@ A 15-key refresh measured 25 ms (1.34 ms a key), so 20 fps leaves ample
 headroom even in the worst case where every key animates -- and writes are
 skipped when the level is unchanged, so the usual cost is far lower."""
 
+WORKING_SUMMARY_SECONDS = 60.0
+"""Default cadence for live progress labels, once per working pane."""
+
+_TASK_FILLER = frozenset({"code", "for", "pr", "pull", "request", "review", "with"})
+
+
+def working_label(title: str, limit: int = 24) -> str:
+    """Turn a terminal title into an immediate, model-free task label."""
+    cleaned = re.sub(r"^[^A-Za-z0-9]+", "", title.strip())
+    pr = re.search(r"\bPR\s*#?(\d+)\b", cleaned, flags=re.IGNORECASE)
+    prefix = f"PR {pr.group(1)}" if pr else ""
+    without_number = re.sub(r"\bPR\s*#?\d+\b", "", cleaned, flags=re.IGNORECASE)
+    words = [
+        word
+        for word in re.findall(r"[A-Za-z0-9][A-Za-z0-9-]*", without_number)
+        if word.lower() not in _TASK_FILLER
+    ]
+    candidates = ([prefix] if prefix else []) + words
+    phrase = ""
+    for word in candidates:
+        proposed = f"{phrase} {word}".strip()
+        if len(proposed) > limit:
+            break
+        phrase = proposed
+    return phrase or cleaned[:limit].rstrip()
+
 
 @dataclass(frozen=True, slots=True)
 class MenuLayout:
@@ -282,6 +309,7 @@ class DeckController:
         summariser: Summariser | None = None,
         lock: LockWatcher | None = None,
         lock_interval: float = POLL_SECONDS,
+        working_summary_interval: float = WORKING_SUMMARY_SECONDS,
     ) -> None:
         self._client = client
         self._surface = surface
@@ -291,7 +319,9 @@ class DeckController:
         self._locked = False
         self._summariser = summariser
         self._summaries: dict[str, PaneSummary] = {}
-        self._summarising: set[str] = set()
+        self._summary_tasks: dict[str, asyncio.Task[None]] = {}
+        self._working_summary_inputs: dict[str, str] = {}
+        self._working_summary_interval = working_summary_interval
         self._reconcile_interval = reconcile_interval
         # Insertion order matters: it is herdr's pane order, and sorting it
         # would replace herdr's arrangement with ours.
@@ -340,6 +370,8 @@ class DeckController:
         return True
 
     def _remove(self, pane_id: str) -> bool:
+        self._cancel_summary(pane_id)
+        self._working_summary_inputs.pop(pane_id, None)
         self._summaries.pop(pane_id, None)
         menu = self._menu
         if menu is not None and menu.pane_id == pane_id:
@@ -452,20 +484,36 @@ class DeckController:
 
     # ---------------------------------------------------------------- summaries
 
-    def _request_summary(self, pane_id: str) -> None:
+    def _request_summary(self, pane_id: str, *, expected_status: str) -> None:
         """Kick off a summary without blocking the caller.
 
         Fire-and-forget on purpose: the key repaints immediately with its status
         animation, and the words arrive a beat later if they arrive at all. The
         deck never waits on the network to draw.
         """
-        if self._summariser is None or pane_id in self._summarising:
+        if self._summariser is None:
             return
-        self._summarising.add(pane_id)
-        task = asyncio.create_task(self._summarise(pane_id), name=f"summary-{pane_id}")
-        task.add_done_callback(lambda _: self._summarising.discard(pane_id))
+        existing = self._summary_tasks.get(pane_id)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(
+            self._summarise(pane_id, expected_status=expected_status),
+            name=f"summary-{pane_id}",
+        )
+        self._summary_tasks[pane_id] = task
 
-    async def _summarise(self, pane_id: str) -> None:
+        def finished(done: asyncio.Task[None]) -> None:
+            if self._summary_tasks.get(pane_id) is done:
+                self._summary_tasks.pop(pane_id, None)
+
+        task.add_done_callback(finished)
+
+    def _cancel_summary(self, pane_id: str) -> None:
+        task = self._summary_tasks.pop(pane_id, None)
+        if task is not None:
+            task.cancel()
+
+    async def _summarise(self, pane_id: str, *, expected_status: str) -> None:
         summariser = self._summariser
         if summariser is None:
             return
@@ -485,12 +533,23 @@ class DeckController:
         if not isinstance(text, str):
             return
 
+        if expected_status == "working":
+            previous = self._working_summary_inputs.get(pane_id)
+            if previous == text:
+                return
+            self._working_summary_inputs[pane_id] = text
+
         summary = await summariser.summarise(text)
         if summary is None:
             return
-        # The pane may have moved on, or gone, while we were waiting.
-        if pane_id not in self._panes:
+        # A periodic working summary must never land after the agent stops and
+        # overwrite its completion summary with stale progress.
+        pane = self._panes.get(pane_id)
+        if pane is None or pane.status != expected_status:
             return
+        if expected_status == "working":
+            # Suggestions are useful once an agent stops, not while it is busy.
+            summary = PaneSummary(phrase=summary.phrase, waiting=False)
         self._summaries[pane_id] = summary
         logger.info(
             "summary for %s: %s%s",
@@ -499,6 +558,20 @@ class DeckController:
             f"  (+{len(summary.replies)} replies)" if summary.replies else "",
         )
         self._dirty.set()
+
+    def _refresh_working_summaries(self) -> None:
+        for pane in self._panes.values():
+            if pane.status == "working":
+                self._request_summary(pane.pane_id, expected_status="working")
+
+    def _seed_working_labels(self) -> None:
+        """Give active panes useful words before the first model refresh."""
+        for pane in self._panes.values():
+            if pane.status != "working" or pane.pane_id in self._summaries:
+                continue
+            label = working_label(pane.terminal_title)
+            if label:
+                self._summaries[pane.pane_id] = PaneSummary(phrase=label, waiting=False)
 
     def replies_for(self, pane_id: str) -> tuple[Reply, ...]:
         """Suggested replies for a pane, if any were offered."""
@@ -910,6 +983,7 @@ class DeckController:
             self._upsert(record)
         self._order = order
         self._focused_workspace = focused
+        self._seed_working_labels()
 
         # Status subscriptions are per pane, so the set has to follow the panes.
         if set(self._panes) != before:
@@ -936,6 +1010,8 @@ class DeckController:
             if isinstance(pane_id, str) and isinstance(status, str):
                 existing = self._panes.get(pane_id)
                 if existing is not None and existing.status != status:
+                    self._cancel_summary(pane_id)
+                    self._working_summary_inputs.pop(pane_id, None)
                     self._panes[pane_id] = replace(existing, status=status)
                     if status == "working":
                         # Only now is the summary out of date. It used to be
@@ -943,12 +1019,21 @@ class DeckController:
                         # the deck and looking away lost the one thing you had
                         # come to read -- and there is no reason to discard it
                         # while the agent is still sitting on that answer.
-                        self._summaries.pop(pane_id, None)
+                        label = working_label(existing.terminal_title)
+                        if label:
+                            self._summaries[pane_id] = PaneSummary(
+                                phrase=label,
+                                waiting=False,
+                            )
+                        else:
+                            self._summaries.pop(pane_id, None)
                         menu = self._menu
                         if menu is not None and menu.pane_id == pane_id:
                             self._menu = None
+                    elif existing.status == "working":
+                        self._summaries.pop(pane_id, None)
                     if worth_summarising(existing.status, status):
-                        self._request_summary(pane_id)
+                        self._request_summary(pane_id, expected_status=status)
                     self._dirty.set()
             return
 
@@ -977,6 +1062,11 @@ class DeckController:
         animator = asyncio.create_task(self._animate_loop(), name="animator")
         reconciler = asyncio.create_task(self._reconcile_loop(), name="reconciler")
         locker = asyncio.create_task(self._lock_loop(), name="locker")
+        working_summaries = (
+            asyncio.create_task(self._working_summary_loop(), name="working-summaries")
+            if self._summariser is not None and self._working_summary_interval > 0
+            else None
+        )
         try:
             async for event in self._client.events():
                 self.handle(event)
@@ -989,7 +1079,15 @@ class DeckController:
             # self-reaping.
             logger.info("event stream closed; herdr is gone, shutting down")
         finally:
-            for task in (painter, animator, reconciler, locker, self._reconnect_task):
+            for task in (
+                painter,
+                animator,
+                reconciler,
+                locker,
+                working_summaries,
+                self._reconnect_task,
+                *self._summary_tasks.values(),
+            ):
                 if task is None:
                     continue
                 task.cancel()
@@ -1025,6 +1123,11 @@ class DeckController:
                 await self.prime()
             except Exception:
                 logger.warning("reconcile failed", exc_info=True)
+
+    async def _working_summary_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self._working_summary_interval)
+            self._refresh_working_summaries()
 
     async def _paint_loop(self) -> None:
         """Coalesce bursts of events into at most one update per interval."""
@@ -1162,6 +1265,7 @@ async def amain(argv: list[str] | None = None) -> int:
         mode=GroupingMode(args.mode),
         summariser=summariser,
         lock=lock_watcher(enabled=not args.no_screen_lock),
+        working_summary_interval=args.working_summary_seconds,
     )
 
     stop = asyncio.Event()
@@ -1212,6 +1316,16 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help=(
             "skip the three-word pane summaries even if a key is configured. "
             "They are already skipped when FIREWORKS_API_KEY is absent"
+        ),
+    )
+    parser.add_argument(
+        "--working-summary-seconds",
+        type=float,
+        default=WORKING_SUMMARY_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "refresh each working pane's progress summary at this cadence; "
+            "0 disables live model calls (default: 60)"
         ),
     )
     parser.add_argument(

@@ -59,6 +59,18 @@ few words by a small hosted model and shown on the key — `remove or deprecate?
 rather than just a red bar. The mark shrinks to the corner to make room, since
 at that moment what it's doing matters more than which agent it is.
 
+Working agents get words too. The terminal title is condensed immediately, so
+several tasks called `Review ...` become labels such as `PR 9139 simplification`
+and `agent steering overhaul` instead of three identical `Review` badges. At
+most once per minute per working pane, that label is refreshed when the live
+transcript changes —
+`validating standalone` or `waiting for 2 agents` — using the same summariser.
+The cadence is intentionally explicit because these are hosted model calls:
+set `--working-summary-seconds SECONDS`, or use `0` to keep only the free title
+label and disable live progress calls. Replies are never offered while an agent
+is still working, and a late progress response cannot overwrite its completion
+summary.
+
 The question mark is appended from a `waiting` flag rather than asked for, so no
 word is spent restating that a question was asked. The agent's mark fades to a
 watermark behind the words, keeping the nameplate and status dot in view.

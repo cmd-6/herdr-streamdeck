@@ -105,6 +105,23 @@ def test_hybrid_surface_mirrors_the_same_face_to_virtual_and_physical(tmp_path: 
         surface.close()
 
 
+def test_blanking_does_not_forget_the_hybrid_surface_brightness(tmp_path: Path) -> None:
+    physical = NullSurface(brightness_=73)
+    virtual = VirtualSurface(
+        state_dir=tmp_path / "state", token_path=tmp_path / "token", port=0
+    )
+    surface = HybridSurface(physical=physical, virtual=virtual)
+    surface.open()
+    try:
+        surface.set_brightness(0)
+        assert surface.brightness == 73
+
+        surface.set_brightness(surface.brightness)
+        assert physical.brightness_written == 73
+    finally:
+        surface.close()
+
+
 def test_virtual_surface_starts_when_usb_is_absent(tmp_path: Path) -> None:
     class MissingDeck(NullSurface):
         def open(self) -> None:

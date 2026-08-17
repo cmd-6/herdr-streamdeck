@@ -50,7 +50,7 @@ class HybridSurface:
 
     @property
     def brightness(self) -> int:
-        return self.virtual.brightness
+        return self.physical.brightness
 
     def open(self) -> None:
         self.virtual.open()

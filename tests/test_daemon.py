@@ -722,7 +722,7 @@ def summariser_returning(summary: PaneSummary | None, calls: list[str]) -> Summa
         raise AssertionError("transport should not be reached")
 
     class Fixed(Summariser):
-        async def summarise(self, transcript: str) -> PaneSummary | None:
+        async def summarise(self, transcript: str, task: str = "") -> PaneSummary | None:
             calls.append(transcript)
             return summary
 
@@ -880,7 +880,7 @@ async def test_finishing_cancels_stale_progress_before_summarising_the_result() 
     class Sequenced(Summariser):
         calls = 0
 
-        async def summarise(self, transcript: str) -> PaneSummary | None:
+        async def summarise(self, transcript: str, task: str = "") -> PaneSummary | None:
             self.calls += 1
             if self.calls == 1:
                 started.set()

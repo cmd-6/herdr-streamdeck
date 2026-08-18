@@ -541,15 +541,34 @@ class Summariser:
     output -- box drawing, spinners, status lines and all -- is about 240 prompt
     tokens and summarises correctly. More context did not improve the answer."""
 
-    def _question(self, transcript: str) -> str:
-        """The user turn: the scrollback, and a pointer at the end of it."""
+    def _question(self, transcript: str, task: str = "") -> str:
+        """The user turn: what the thread is for, then where it has got to.
+
+        The declared task leads because the scrollback usually cannot supply
+        it. What arrives here is the tail of a terminal -- sixty lines of
+        whatever the agent is doing this minute -- and the request that set the
+        thread going scrolled out of view long ago. Asked to name the thread
+        from that alone, a model can only name the current activity, which is
+        how a bug investigation came to be called "Access Linear issue
+        details": the agent happened to be querying a database at the time.
+        """
         body = strip_status_lines(strip_input_box(transcript))[-self.max_chars :]
+        declared = (
+            f"The agent's own title for this thread:\n---\n{task.strip()}\n---\n\n"
+            if task.strip()
+            else ""
+        )
         return (
+            f"{declared}"
             f"Agent transcript (scrollback):\n---\n{body}\n---\n\n"
             f"The agent's latest message ends here:\n---\n{last_message(body)}\n---\n"
-            "Summarise the agent's latest message. Use the scrollback above only "
-            "for context, and never describe a question from earlier in it -- "
-            "those were answered already."
+            "Name the thread's task in `summary`. The title above, where there "
+            "is one, is the agent's own statement of that task and is usually "
+            "right -- prefer it, and use the scrollback to sharpen or complete "
+            "it rather than to replace it. What the agent is doing in these "
+            "last lines is a step within the task, not the task.\n"
+            "Base `responses` on the latest message only, and never on a "
+            "question from earlier in the scrollback -- those were answered."
         )
 
     def _schema(self) -> dict[str, Any]:
@@ -622,8 +641,12 @@ class Summariser:
                     return text
         return None
 
-    async def summarise(self, transcript: str) -> PaneSummary | None:
-        """Summarise a pane's recent output. None on any failure at all.
+    async def summarise(self, transcript: str, task: str = "") -> PaneSummary | None:
+        """Name a pane's thread and offer replies. None on any failure at all.
+
+        ``task`` is the agent's own title for the thread, which anchors the
+        name; without it the only evidence is the scrollback tail, and the
+        name degenerates into a description of the current step.
 
         A response that does not conform is retried, with the model shown its
         own output and told what was wrong with it. Transport failures are not
@@ -635,7 +658,7 @@ class Summariser:
 
         messages: list[dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": self._question(transcript)},
+            {"role": "user", "content": self._question(transcript, task)},
         ]
 
         for attempt in range(1, max(1, self.attempts) + 1):

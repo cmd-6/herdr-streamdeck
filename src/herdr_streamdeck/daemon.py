@@ -663,11 +663,16 @@ class DeckController:
         if not isinstance(text, str):
             return
 
-        summary = await summariser.summarise(text)
+        asked_about = self._panes.get(pane_id)
+        if asked_about is None:
+            return
+
+        summary = await summariser.summarise(text, task=self._declared_task(asked_about))
         if summary is None:
             return
-        # A periodic working summary must never land after the agent stops and
-        # overwrite its completion summary with stale progress.
+        # Re-read rather than reused: the await above is a network round trip,
+        # and a summary must never land after the agent has moved on and
+        # describe a state it has already left.
         pane = self._panes.get(pane_id)
         if pane is None or pane.status != expected_status:
             return
@@ -696,6 +701,17 @@ class DeckController:
             f"  (+{len(summary.replies)} replies)" if summary.replies else "",
         )
         self._dirty.set()
+
+    def _declared_task(self, pane: Pane) -> str:
+        """The best available statement of what this thread is for.
+
+        A name you chose beats the agent's own title, which beats nothing.
+        Handed to the model as an anchor rather than used directly: the title
+        is written for a title bar and is often cut off mid-word ("ENG-4881
+        dropdown form layout bug inv..."), which the model can complete from
+        the scrollback where a straight copy could not.
+        """
+        return self.deliberate_space_name(pane) or pane.given_name or pane.terminal_title
 
     @staticmethod
     def _subject_of(pane: Pane) -> str:

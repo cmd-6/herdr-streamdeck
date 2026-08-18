@@ -7,6 +7,8 @@ order of its own. Several of these exist specifically to fail if someone
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from herdr_streamdeck.layout import (
@@ -23,7 +25,7 @@ from herdr_streamdeck.layout import (
 MK2 = Grid(rows=3, columns=5)
 
 
-def pane(pane_id: str, workspace: str = "w1", tab: str = "w1:t1", **kw: str) -> Pane:
+def pane(pane_id: str, workspace: str = "w1", tab: str = "w1:t1", **kw: Any) -> Pane:
     return Pane(pane_id=pane_id, workspace_id=workspace, tab_id=tab, **kw)
 
 

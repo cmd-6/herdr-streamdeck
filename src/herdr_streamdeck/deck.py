@@ -191,6 +191,21 @@ class ButtonFace:
     border: RGB | None = None
     """Outline around the whole key. Marks the selected reply in the menu."""
 
+    title: str = ""
+    """The pane's name, given the body of the key rather than a corner.
+
+    Set only by the title style, where the point is that a name like "Review
+    agent steering overhaul PR" is the most useful thing a key can carry. The
+    badge cannot hold it: it abbreviates to BADGE_LENGTH characters, which
+    turns that sentence into "Review a"."""
+
+    title_style: bool = False
+    """Draw the text-forward layout: name in the body, mark shrunk to a chip.
+
+    Kept as a flag rather than a second face type so a key can be switched
+    over -- one key, or every key -- without a parallel set of call sites.
+    """
+
     summary_size: int = 0
     """Force a type size for ``summary``, and centre it in the whole key.
 
@@ -242,6 +257,8 @@ class DeckDevice(Protocol):
     def reset(self) -> None: ...
 
     def is_open(self) -> bool: ...
+
+    def connected(self) -> bool: ...
 
     def key_count(self) -> int: ...
 
@@ -299,6 +316,16 @@ class ButtonSurface(Protocol):
         """Try to reacquire the device. False if it is still absent."""
         ...
 
+    def alive(self, *, deep: bool = False) -> bool:
+        """Whether the device is still there, asked without writing to it.
+
+        Every other way we learn a deck is gone costs a write, and an idle
+        deck is never written to, so this is the only thing that notices a
+        dock and undock while all the panes are quiet. A surface that answers
+        False has already let go of the device: call ``reopen`` next.
+        """
+        ...
+
     @property
     def brightness(self) -> int:
         """The percentage the deck runs at when it is showing anything."""
@@ -331,6 +358,12 @@ class NullSurface:
     brightness_written: int = 60
     """Last value actually written. Zero is how a test sees a blanked deck."""
 
+    alive_: bool = True
+    """Set False to make the surface report a deck that vanished silently."""
+
+    deep_probes: int = 0
+    """How many ``alive(deep=True)`` calls arrived. Lets tests assert cadence."""
+
     _handler: PressHandler | None = None
 
     @property
@@ -357,7 +390,13 @@ class NullSurface:
 
     def reopen(self) -> bool:
         self.opened = True
+        self.alive_ = True
         return True
+
+    def alive(self, *, deep: bool = False) -> bool:
+        if deep:
+            self.deep_probes += 1
+        return self.alive_
 
     @property
     def brightness(self) -> int:
@@ -518,6 +557,38 @@ class StreamDeckSurface:
             return False
         return True
 
+    def alive(self, *, deep: bool = False) -> bool:
+        """Ask whether the deck is still there without writing to it.
+
+        Holding a device object proves nothing. When a transport read fails,
+        the StreamDeck package's own reader thread closes the handle from
+        under us -- silently, on its own thread, with no callback -- and
+        leaves us pointing at a device that will refuse the next write. Since
+        the next write may be hours away on an idle deck, that is precisely
+        the window in which an undock and redock goes unnoticed and the deck
+        sits on the logo it draws at power-on.
+
+        ``is_open`` is a locked attribute read: no USB traffic, no syscall,
+        cheap enough to ask on a short beat. ``deep`` re-enumerates as well,
+        which is the only way to catch a deck that came back on a fresh HID
+        path while our handle stayed nominally open -- pricier, so callers
+        space it out.
+
+        Answering False drops the device, so ``reopen`` is the next call.
+        """
+        deck = self._deck
+        if deck is None:
+            return False
+        try:
+            gone = not deck.is_open() or (deep and not deck.connected())
+        except Exception:
+            logger.debug("liveness probe failed", exc_info=True)
+            gone = True
+        if gone:
+            self._drop()
+            return False
+        return True
+
     @property
     def brightness(self) -> int:
         return self._brightness
@@ -654,6 +725,12 @@ def compose_foreground(size: tuple[int, int], face: ButtonFace) -> ImageLike:
         _draw_microphone(draw, width, height, face.mark_color)
         drew_icon = True
 
+    if face.title_style:
+        _compose_title(layer, draw, size, face, drew_icon)
+        if face.border is not None:
+            _draw_border(draw, width, height, face.border)
+        return layer
+
     summarised = bool(face.summary)
 
     if face.mark and not drew_icon:
@@ -686,17 +763,160 @@ def compose_foreground(size: tuple[int, int], face: ButtonFace) -> ImageLike:
         _draw_badge(draw, face.badge, width, height)
 
     if face.border is not None:
-        # Last, and inset by its own width, so the whole stroke lands on the key
-        # rather than half of it falling off the edge.
-        inset = BORDER_WIDTH / 2
-        draw.rounded_rectangle(
-            (inset, inset, width - 1 - inset, height - 1 - inset),
-            radius=6,
-            outline=face.border,
-            width=BORDER_WIDTH,
-        )
+        _draw_border(draw, width, height, face.border)
 
     return layer
+
+
+def _draw_border(draw: ImageDrawLike, width: int, height: int, color: RGB) -> None:
+    """Inset by its own width, so the whole stroke lands on the key rather
+    than half of it falling off the edge."""
+    inset = BORDER_WIDTH / 2
+    draw.rounded_rectangle(
+        (inset, inset, width - 1 - inset, height - 1 - inset),
+        radius=6,
+        outline=color,
+        width=BORDER_WIDTH,
+    )
+
+
+TITLE_CAP = 17
+"""Largest type the title body will use. Above this, three words fill the key."""
+
+TITLE_LINES = 4
+"""One more line than the summary layout allows.
+
+The names worth reading are sentences -- "Review agent steering overhaul PR" is
+five words -- and a fourth line is what lets those land at a readable size
+instead of dropping two sizes to fit three."""
+
+TITLE_LEADING = 1.06
+
+MARK_CHIP_SCALE = 0.17
+"""The mark's height as a fraction of the key, in the title style.
+
+Down from 0.36 centred. The glyph answers "which agent", which is a question
+you have usually already answered from the column -- so it earns a corner, not
+the middle. Kept above ~12px so the asterisk and the pi stay distinguishable.
+"""
+
+
+def _compose_title(
+    layer: ImageLike,
+    draw: ImageDrawLike,
+    size: tuple[int, int],
+    face: ButtonFace,
+    drew_icon: bool,
+) -> None:
+    """Text-forward key: the name gets the body, the mark gets a corner.
+
+    The old layout put the agent glyph in the middle at 36% of the key and
+    left the name an eight-character nameplate. That is backwards for a deck
+    of a dozen panes: every key in a column carries the *same* glyph, so the
+    glyph distinguishes nothing, while the name is the only thing that says
+    which pane this is. Here the name takes the body and the mark shrinks to a
+    chip in the top-left, opposite the status dot.
+    """
+    width, height = size
+    text = face.title or face.summary
+    if not text:
+        return
+
+    top = height * 0.05
+    if face.mark and not drew_icon:
+        nominal = max(MIN_MARK_SIZE, int(height * MARK_CHIP_SCALE * face.mark_scale))
+        mark_font = fit_font(draw, face.mark, nominal, width * 0.3)
+        draw.text(
+            (width * 0.11, height * 0.13),
+            face.mark,
+            font=mark_font,
+            anchor="mm",
+            fill=face.mark_color,
+        )
+        # Only the mark's own row is spoken for; the text starts under it and
+        # then has the full width, rather than being indented all the way down.
+        top = height * 0.24
+
+    available = height * 0.95 - top
+    lines, point, font = _fit_title(draw, text, width, available)
+    if lines is None:
+        return
+
+    step = point * TITLE_LEADING
+    start = top + (available - len(lines) * step) / 2
+    for index, line in enumerate(lines):
+        draw.text(
+            (width / 2, start + step * (index + 0.5)),
+            line,
+            font=font,
+            anchor="mm",
+            fill=SUMMARY_COLOR,
+        )
+
+
+def _fit_title(
+    draw: ImageDrawLike, text: str, width: int, available: float
+) -> tuple[list[str] | None, int, ImageFontLike]:
+    """Largest size at which the whole name fits the body in TITLE_LINES.
+
+    Unlike a summary, a name is not written to fit a key: it arrives as
+    whatever the agent or the user called it, and one token can be wider than
+    the key at every size we are willing to draw -- "Streamdeck-herdr" is. So
+    the fit degrades in steps rather than giving up, because a blank key is
+    the worst possible answer to "which pane is this".
+    """
+    budget = width * 0.92
+    for splitter in (None, _split_at_punctuation):
+        candidate = text if splitter is None else splitter(text)
+        for point in range(TITLE_CAP, MIN_MARK_SIZE - 1, -1):
+            font = load_font(point)
+            lines = wrap_to_width(draw, candidate, font, budget)
+            if not lines:
+                continue
+            if len(lines) <= TITLE_LINES and len(lines) * point * TITLE_LEADING <= available:
+                return lines, point, font
+
+    # Nothing breaks on a space or a hyphen small enough, so break the
+    # characters themselves. Ugly, and still far better than an empty key.
+    point = MIN_MARK_SIZE
+    font = load_font(point)
+    lines = _wrap_hard(draw, text, font, budget)[:TITLE_LINES]
+    return (lines or None), point, font
+
+
+def _split_at_punctuation(text: str) -> str:
+    """Let a wrap happen after a hyphen, slash or underscore.
+
+    The separator stays on the leading line, so "Streamdeck-herdr" breaks as
+    "Streamdeck-" / "herdr" and still reads as one name.
+    """
+    out: list[str] = []
+    for word in text.split():
+        piece = ""
+        for character in word:
+            piece += character
+            if character in "-/_" and piece.strip("-/_"):
+                out.append(piece)
+                piece = ""
+        if piece:
+            out.append(piece)
+    return " ".join(out)
+
+
+def _wrap_hard(draw: ImageDrawLike, text: str, font: ImageFontLike, budget: float) -> list[str]:
+    """Greedy wrap that will break mid-word. The last resort."""
+    lines: list[str] = []
+    current = ""
+    for character in text:
+        candidate = current + character
+        if current and draw.textlength(candidate, font=font) > budget:
+            lines.append(current)
+            current = character.lstrip()
+            continue
+        current = candidate
+    if current:
+        lines.append(current)
+    return lines
 
 
 def _draw_microphone(draw: ImageDrawLike, width: int, height: int, color: RGB) -> None:

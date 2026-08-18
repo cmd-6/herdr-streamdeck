@@ -57,7 +57,7 @@ SCHEMA: dict[str, Any] = {
         "summary": {
             "type": "string",
             "description": (
-                "2-4 short words, at most 24 characters including spaces. "
+                "4-6 short words, at most 42 characters including spaces. "
                 "When the agent offers alternatives, name them: "
                 "'remove or deprecate?', not 'endpoint deprecation'."
             ),
@@ -81,7 +81,7 @@ SCHEMA: dict[str, Any] = {
 }
 
 SHAPE = """Return ONLY this JSON object, with every field present and no extra fields:
-{"waiting": <true|false>, "summary": "<2-4 short words>",
+{"waiting": <true|false>, "summary": "<4-6 short words>",
  "responses": [{"kind": "affirmative"|"negative"|"proceed"|"alternative",
                 "label": "<1-3 words>", "text": "<full reply>"}]}
 `waiting` is required and must always be present. Every response object must have
@@ -90,14 +90,31 @@ all three of kind, label and text."""
 
 
 SYSTEM_PROMPT = (
-    """You are summarising a response from a coding agent in 2-4
+    """You are summarising a response from a coding agent in 4-6
 words, and generating a few possible short replies. The goal is to convey the
 agent's intent or question in few enough characters to display legibly on a
 small key.
 
 The words appear on a physical Stream Deck key: a 72x72 pixel square. Only about
-18 characters fit on a line and only three lines fit, so prefer short common
-words. A long word shrinks the whole label.
+17 characters fit on a line and four lines fit, so prefer short common words. A
+long word shrinks the whole label.
+
+Use the room. Two or three words is usually too few to identify a task among a
+dozen of them: "attachment checks" could be any of five panes, where "attachment
+checks failing on upload" is unmistakable. Name the specific thing -- the file,
+the endpoint, the test, the error -- rather than the category it belongs to.
+
+Name the subject, not just the activity. A number identifies a thing only to
+whoever already knows what it is, so when the transcript makes the subject clear
+spend one or two words on *what* the work is about and drop the identifier.
+  reviewing PR #9507, which reworks how user messages are attributed
+      GOOD  Review/simplify user msg attribution PR
+      BAD   Review PR #9507 for code simplification
+  fixing a flaky test in the billing webhook suite
+      GOOD  Fix flaky billing webhook test
+      BAD   Fix flaky test in PR #412
+Only when you are confident. If the transcript never says what the change is
+about, keep the identifier -- a wrong subject is far worse than a vague one.
 
 The `waiting` field already records whether a question was asked, and the deck
 appends its own question mark. Never spend words restating that. Do not use:
@@ -374,11 +391,11 @@ Whitespace is not enough of a test. A quantized model emitted
 fragment of the serialiser bleeding into a string field.
 """
 
-MAX_PHRASE_WORDS = 6
-MAX_PHRASE_CHARS = 40
+MAX_PHRASE_WORDS = 8
+MAX_PHRASE_CHARS = 58
 """Generous ceilings, not the target.
 
-The prompt asks for 2-4 words and 24 characters; these only catch a model that
+The prompt asks for 4-6 words and 42 characters; these only catch a model that
 has started writing prose. Rejecting at the target would throw away good labels
 that ran one word long, which is a worse trade than rendering them slightly
 smaller.

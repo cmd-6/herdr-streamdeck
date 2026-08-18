@@ -36,8 +36,8 @@ from herdr_streamdeck.deck import (
     PressHandler,
 )
 from herdr_streamdeck.icons import mark_for
-from herdr_streamdeck.layout import Grid
-from herdr_streamdeck.protocol import Event, HerdrError, JSONObject
+from herdr_streamdeck.layout import Grid, GroupingMode
+from herdr_streamdeck.protocol import Event, HerdrError, JSONObject, JSONValue
 from herdr_streamdeck.summary import PaneSummary, Reply, Summariser
 
 
@@ -66,6 +66,7 @@ class StubClient:
         self._snapshot = snapshot or {}
         self._events = events or []
         self._workspaces = list(workspaces)
+        self.workspace_labels: dict[str, str] = {}
         self.requests: list[tuple[str, JSONObject | None]] = []
         self.subscriptions: list[JSONObject] = []
         self.resubscribes = 0
@@ -80,7 +81,11 @@ class StubClient:
         if method == "workspace.list":
             return {
                 "workspaces": [
-                    {"workspace_id": w, "label": w, "focused": i == 0}
+                    {
+                        "workspace_id": w,
+                        "label": self.workspace_labels.get(w, w),
+                        "focused": i == 0,
+                    }
                     for i, w in enumerate(self._workspaces)
                 ]
             }
@@ -115,10 +120,11 @@ def make_controller(
     workspaces: Sequence[str] = ("w1",),
     rows: int = 3,
     columns: int = 5,
+    mode: GroupingMode = GroupingMode.AGENT,
 ) -> tuple[DeckController, NullSurface, StubClient]:
     client = StubClient(snapshot, workspaces=workspaces)
     surface = NullSurface(key_count_=rows * columns, key_layout_=(rows, columns))
-    return DeckController(client, surface), surface, client
+    return DeckController(client, surface, mode=mode), surface, client
 
 
 def tap(controller: DeckController, index: int) -> None:
@@ -164,7 +170,9 @@ def test_iter_panes_preserves_snapshot_order() -> None:
 
 async def test_prime_mirrors_herdr_column_order() -> None:
     snapshot: JSONObject = {"panes": [pane_record("w2:p1", "w2"), pane_record("w1:p1", "w1")]}
-    controller, _, _ = make_controller(snapshot=snapshot, workspaces=("w2", "w1"))
+    controller, _, _ = make_controller(
+        snapshot=snapshot, workspaces=("w2", "w1"), mode=GroupingMode.WORKSPACE
+    )
     await controller.prime()
 
     # w2 leads the listing, so it owns column 0 despite sorting later.
@@ -174,7 +182,7 @@ async def test_prime_mirrors_herdr_column_order() -> None:
     assert controller._columns[1].id == "w1"
 
 
-async def test_agent_mark_and_badge_are_drawn() -> None:
+async def test_agent_mark_and_given_name_are_drawn() -> None:
     snapshot: JSONObject = {
         "panes": [pane_record("w1:p1", display_agent="qwencode", title="deploy-review")]
     }
@@ -183,7 +191,8 @@ async def test_agent_mark_and_badge_are_drawn() -> None:
 
     face = surface.faces[0]
     assert face.mark == mark_for("qwencode").glyph
-    assert face.badge == "deploy-r", "badge is abbreviated to fit the key"
+    assert face.title == "deploy-review", "the whole name, not an abbreviation"
+    assert face.title_style, "panes draw name-forward"
 
 
 async def test_status_sets_the_strip_not_the_field() -> None:
@@ -211,7 +220,7 @@ async def test_unknown_status_draws_no_strip() -> None:
 async def test_unoccupied_keys_are_blank() -> None:
     controller, surface, _ = make_controller(snapshot={"panes": []})
     await controller.prime()
-    assert all(f.mark == "" and f.badge == "" for f in surface.faces.values())
+    assert all(f.mark == "" and f.title == "" for f in surface.faces.values())
 
 
 # ---------------------------------------------------------------------- events
@@ -291,7 +300,9 @@ async def test_press_focuses_the_pane_under_that_key() -> None:
             pane_record("w2:p1", "w2"),
         ]
     }
-    controller, surface, client = make_controller(snapshot=snapshot, workspaces=("w1", "w2"))
+    controller, surface, client = make_controller(
+        snapshot=snapshot, workspaces=("w1", "w2"), mode=GroupingMode.WORKSPACE
+    )
     controller._loop = asyncio.get_running_loop()
     surface.set_press_handler(controller._on_press)
     await controller.prime()
@@ -552,7 +563,7 @@ async def test_changed_face_is_re_rendered() -> None:
     controller.repaint()
 
     assert controller._frames[0] is not first
-    assert controller._frames[0].face.badge == "renamed"
+    assert controller._frames[0].face.title == "renamed"
 
 
 async def test_icon_override_reaches_the_face(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -743,7 +754,7 @@ async def test_blocking_asks_for_a_summary_and_shows_it() -> None:
     controller.repaint()
 
     assert calls == ["agent output"], "the pane's own output should be summarised"
-    assert surface.faces[0].summary == SHOWN
+    assert surface.faces[0].title == SHOWN
     assert [r[0] for r in client.requests].count("pane.read") == 1
 
 
@@ -767,7 +778,7 @@ async def test_starting_work_uses_the_terminal_title_without_a_model_call() -> N
     controller.repaint()
 
     assert calls == []
-    assert surface.faces[0].summary == "PR 9139 simplification"
+    assert surface.faces[0].title == "PR 9139 simplification"
 
 
 @pytest.mark.parametrize(
@@ -807,7 +818,7 @@ async def test_working_progress_is_refreshed_from_the_live_transcript() -> None:
     controller.repaint()
 
     assert calls == ["agent output"]
-    assert surface.faces[0].summary == "remove or deprecate"
+    assert surface.faces[0].title == "remove or deprecate"
     assert controller.replies_for("w1:p1") == (), "busy agents must not offer replies"
 
     controller._refresh_working_summaries()
@@ -847,7 +858,7 @@ async def test_finishing_cancels_stale_progress_before_summarising_the_result() 
     await asyncio.sleep(0)
     controller.repaint()
 
-    assert surface.faces[0].summary == "review finished"
+    assert surface.faces[0].title == "review finished"
 
 
 async def test_finishing_a_turn_is_summarised() -> None:
@@ -867,7 +878,7 @@ async def test_finishing_a_turn_is_summarised() -> None:
     controller.repaint()
 
     assert calls == ["agent output"]
-    assert surface.faces[0].summary == SHOWN
+    assert surface.faces[0].title == SHOWN
 
 
 @pytest.mark.parametrize(
@@ -901,11 +912,49 @@ async def test_a_new_status_drops_the_old_summary_immediately() -> None:
     await asyncio.sleep(0)
     await asyncio.sleep(0)
     controller.repaint()
-    assert surface.faces[0].summary
+    assert surface.faces[0].title
 
     controller.handle(status_changed("w1:p1", "working"))
     controller.repaint()
-    assert surface.faces[0].summary == ""
+    assert surface.faces[0].title == ""
+
+
+async def test_a_name_you_chose_outranks_the_model_title() -> None:
+    """A rename says what the pane is *for*; a summary only says what it is
+    doing. The first does not go stale, so it is never displaced by the
+    second -- not even while the summary is fresh."""
+    calls: list[str] = []
+    controller, surface, _ = make_controller(
+        snapshot={"panes": [pane_record("w1:p1", label="release-cut")]}
+    )
+    controller._summariser = summariser_returning(SUMMARY, calls)
+    await controller.prime()
+
+    controller.handle(status_changed("w1:p1", "blocked"))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    controller.repaint()
+
+    assert surface.faces[0].title == "release-cut"
+    assert SHOWN not in surface.faces[0].title
+
+
+async def test_an_unnamed_pane_falls_through_to_the_model_title() -> None:
+    calls: list[str] = []
+    controller, surface, _ = make_controller(
+        snapshot={"panes": [pane_record("w1:p1", terminal_title_stripped="npm run build")]}
+    )
+    controller._summariser = summariser_returning(SUMMARY, calls)
+    await controller.prime()
+    # No name and no summary yet: the terminal title is better than a blank key.
+    assert surface.faces[0].title == "npm run build"
+
+    controller.handle(status_changed("w1:p1", "blocked"))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    controller.repaint()
+
+    assert surface.faces[0].title == SHOWN
 
 
 async def test_a_failing_summariser_leaves_the_deck_working() -> None:
@@ -919,7 +968,7 @@ async def test_a_failing_summariser_leaves_the_deck_working() -> None:
     await asyncio.sleep(0)
     controller.repaint()
 
-    assert surface.faces[0].summary == ""
+    assert surface.faces[0].title == ""
     assert surface.faces[0].mark == mark_for("claude").glyph, "the key still renders"
 
 
@@ -930,7 +979,7 @@ async def test_no_summariser_is_a_supported_state() -> None:
     await asyncio.sleep(0)
     controller.repaint()
 
-    assert surface.faces[0].summary == ""
+    assert surface.faces[0].title == ""
     assert "pane.read" not in [r[0] for r in client.requests]
 
 
@@ -1152,20 +1201,20 @@ async def test_a_summary_survives_being_looked_at() -> None:
     came to read. Nothing about viewing it makes it wrong."""
     controller, surface, _ = await menued()
     controller.repaint()
-    assert surface.faces[0].summary == SHOWN
+    assert surface.faces[0].title == SHOWN
 
     for _ in range(20):
         controller.tick(now=5.0)
         controller.repaint()
 
-    assert surface.faces[0].summary == SHOWN
+    assert surface.faces[0].title == SHOWN
 
 
 async def test_a_summary_survives_a_status_change_that_is_not_work() -> None:
     controller, surface, _ = await menued()
     controller.handle(status_changed("w1:p1", "idle"))
     controller.repaint()
-    assert surface.faces[0].summary == SHOWN
+    assert surface.faces[0].title == SHOWN
 
 
 async def test_a_summary_is_cleared_when_the_agent_starts_working() -> None:
@@ -1173,7 +1222,7 @@ async def test_a_summary_is_cleared_when_the_agent_starts_working() -> None:
     controller, surface, _ = await menued()
     controller.handle(status_changed("w1:p1", "working"))
     controller.repaint()
-    assert surface.faces[0].summary == ""
+    assert surface.faces[0].title == ""
 
 
 # ------------------------------------------------------------- disconnection
@@ -1209,6 +1258,11 @@ class FlakySurface(NullSurface):
 
     def reopen(self) -> bool:
         self.reopen_attempts += 1
+        return self.plugged
+
+    def alive(self, *, deep: bool = False) -> bool:
+        if deep:
+            self.deep_probes += 1
         return self.plugged
 
 
@@ -1302,6 +1356,76 @@ async def test_the_model_stays_current_while_disconnected() -> None:
     assert "w1:p2" in controller._panes
 
 
+async def test_the_heartbeat_notices_a_deck_that_left_without_a_write() -> None:
+    """The case a write can never catch: nothing on the deck is changing.
+
+    An idle pane is steady, tick() skips a key whose level has not moved, and
+    so an undocked deck is never written to and never found to be missing.
+    Without the heartbeat this sits unnoticed until some pane happens to
+    change -- and meanwhile the deck shows its power-on logo.
+    """
+    controller, surface = await flaky()
+    import herdr_streamdeck.daemon as daemon
+
+    original = daemon.HEARTBEAT_SECONDS
+    daemon.HEARTBEAT_SECONDS = 0.02
+    beat = asyncio.create_task(controller._heartbeat_loop())
+    try:
+        surface.plugged = False
+        before = surface.writes_attempted
+        await asyncio.sleep(0.1)
+        noticed = controller._connected is False
+        untouched = surface.writes_attempted == before
+    finally:
+        daemon.HEARTBEAT_SECONDS = original
+        beat.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await beat
+
+    assert noticed, "an idle deck vanished and nothing noticed"
+    assert untouched, "it should not have taken a write to find out"
+
+
+async def test_the_heartbeat_re_enumerates_only_now_and_then() -> None:
+    """The cheap probe rides every beat; the pricey one does not."""
+    controller, surface = await flaky()
+    import herdr_streamdeck.daemon as daemon
+
+    original = daemon.HEARTBEAT_SECONDS
+    daemon.HEARTBEAT_SECONDS = 0.01
+    beat = asyncio.create_task(controller._heartbeat_loop())
+    try:
+        await asyncio.sleep(0.16)
+    finally:
+        daemon.HEARTBEAT_SECONDS = original
+        beat.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await beat
+
+    assert surface.deep_probes >= 1, "the deep probe never ran"
+    assert surface.deep_probes * daemon.DEEP_PROBE_EVERY <= 16 + daemon.DEEP_PROBE_EVERY
+
+
+async def test_the_heartbeat_leaves_a_known_disconnect_to_the_reconnect_loop() -> None:
+    """Two loops chasing the same device would just race to reopen it."""
+    controller, surface = await flaky()
+    controller._connected = False
+    import herdr_streamdeck.daemon as daemon
+
+    original = daemon.HEARTBEAT_SECONDS
+    daemon.HEARTBEAT_SECONDS = 0.01
+    beat = asyncio.create_task(controller._heartbeat_loop())
+    try:
+        await asyncio.sleep(0.08)
+    finally:
+        daemon.HEARTBEAT_SECONDS = original
+        beat.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await beat
+
+    assert surface.reopen_attempts == 0
+
+
 async def test_frames_are_rebuilt_rather_than_reused_after_a_reconnect() -> None:
     """They were encoded against the previous device handle."""
     controller, surface = await flaky()
@@ -1339,7 +1463,7 @@ async def test_locking_blacks_the_keys_before_killing_the_backlight() -> None:
     snapshot: JSONObject = {"panes": [pane_record("w1:p1", title="deploy")]}
     controller, surface, _ = make_controller(snapshot=snapshot)
     await controller.prime()
-    assert surface.faces[0].badge == "deploy"
+    assert surface.faces[0].title == "deploy"
 
     controller.set_locked(True)
 
@@ -1359,7 +1483,7 @@ async def test_unlocking_puts_the_panes_back() -> None:
     controller.set_locked(False)
 
     assert surface.brightness_written == surface.brightness
-    assert surface.faces[0].badge == "deploy"
+    assert surface.faces[0].title == "deploy"
 
 
 async def test_a_locked_deck_does_not_repaint() -> None:
@@ -1553,3 +1677,120 @@ async def test_a_reorder_rebuilds_the_columns() -> None:
     )
 
     assert controller._restructure is True
+
+
+# ------------------------------------------------------- the agent layout
+
+
+def agent_record(pane_id: str, workspace: str, *, seq: int = 0, **rest: Any) -> JSONObject:
+    record = pane_record(pane_id, workspace, **rest)
+    record["state_change_seq"] = seq
+    return record
+
+
+async def test_the_ten_most_recent_agents_are_shown_oldest_first() -> None:
+    """Two orderings doing two jobs: recency picks, creation places."""
+    panes: list[JSONValue] = [
+        agent_record(f"w{i:X}:p1", f"w{i:X}", seq=i) for i in range(1, 13)
+    ]
+    snapshot: JSONObject = {"panes": panes}
+    controller, _, _ = make_controller(
+        snapshot=snapshot, workspaces=tuple(f"w{i:X}" for i in range(1, 13))
+    )
+    await controller.prime()
+
+    grid = controller.grid
+    shown = [
+        p.pane_id if (p := grid.pane_at(controller._columns, k)) else None for k in range(15)
+    ]
+    # w1 and w2 have the two lowest seqs, so they are the two that lose a key.
+    assert shown[:10] == [f"w{i:X}:p1" for i in range(3, 13)]
+    assert shown[10:] == [None] * 5, "the bottom row stays free for actions"
+
+
+async def test_activity_changes_who_is_shown_but_not_the_order() -> None:
+    """A key that moved under your finger because an agent spoke is a bug."""
+    panes: list[JSONValue] = [
+        agent_record(f"w{i:X}:p1", f"w{i:X}", seq=i) for i in range(1, 13)
+    ]
+    snapshot: JSONObject = {"panes": panes}
+    controller, _, _ = make_controller(
+        snapshot=snapshot, workspaces=tuple(f"w{i:X}" for i in range(1, 13))
+    )
+    await controller.prime()
+
+    # w1 was off the deck; waking it up should displace the next-stalest.
+    controller.handle(status_changed("w1:p1", "working"))
+    controller.repaint()
+
+    grid = controller.grid
+    shown = [
+        p.pane_id if (p := grid.pane_at(controller._columns, k)) else None for k in range(10)
+    ]
+    assert "w1:p1" in shown, "the agent that just woke is not on the deck"
+    assert "w3:p1" not in shown, "the stalest visible agent should have been dropped"
+    assert shown == sorted(x for x in shown if x), "still oldest-first by creation"
+
+
+async def test_a_cosmetic_update_does_not_reshuffle_the_deck() -> None:
+    """`pane.updated` carries no state_change_seq; zeroing it would reorder."""
+    panes: list[JSONValue] = [
+        agent_record(f"w{i:X}:p1", f"w{i:X}", seq=i) for i in range(1, 13)
+    ]
+    snapshot: JSONObject = {"panes": panes}
+    controller, _, _ = make_controller(
+        snapshot=snapshot, workspaces=tuple(f"w{i:X}" for i in range(1, 13))
+    )
+    await controller.prime()
+    grid = controller.grid
+
+    def placement() -> list[str | None]:
+        return [
+            p.pane_id if (p := grid.pane_at(controller._columns, k)) else None
+            for k in range(15)
+        ]
+
+    before = placement()
+    controller.handle(updated(pane_record("wC:p1", "wC", terminal_title_stripped="new title")))
+    controller.repaint()
+
+    assert controller._panes["wC:p1"].state_change_seq == 12, "recency was dropped"
+    assert placement() == before, "a cosmetic update moved keys around"
+    assert controller._panes["wC:p1"].terminal_title == "new title", "the update still landed"
+
+
+async def test_a_renamed_space_names_its_keys() -> None:
+    """The rename herdr's sidebar offers is workspace.rename, so it must win."""
+    controller, surface, client = make_controller(
+        snapshot={
+            "panes": [
+                pane_record("w1:p1", "w1", cwd="/Users/x/Developer/v2", label="stale-pane-name")
+            ]
+        }
+    )
+    client.workspace_labels = {"w1": "Codex Subscription ZDR Question"}
+    await controller.prime()
+
+    assert surface.faces[0].title == "Codex Subscription ZDR Question"
+
+
+async def test_an_auto_labelled_space_does_not_name_its_keys() -> None:
+    """herdr seeds workspace.label with the checkout name, so six spaces on
+    one repo all read `v2-dos`. Using that would replace useful titles with
+    six copies of a directory name."""
+    controller, surface, client = make_controller(
+        snapshot={
+            "panes": [
+                pane_record(
+                    "w1:p1",
+                    "w1",
+                    cwd="/Users/x/Developer/v2-dos",
+                    terminal_title_stripped="Review PR #9029",
+                )
+            ]
+        }
+    )
+    client.workspace_labels = {"w1": "v2-dos"}
+    await controller.prime()
+
+    assert surface.faces[0].title == "Review PR #9029"

@@ -13,6 +13,9 @@ logger = logging.getLogger(__name__)
 
 RECONNECT_SECONDS = 3.0
 
+DEEP_PROBE_EVERY = 5
+"""Beats between re-enumerating rather than just asking the handle."""
+
 
 @dataclass
 class HybridSurface:
@@ -109,10 +112,40 @@ class HybridSurface:
                 self._physical_connected = False
                 logger.warning("physical deck disconnected; virtual deck remains available")
 
+    def alive(self, *, deep: bool = False) -> bool:
+        # The virtual half never goes away, and the physical half is this
+        # thread's business rather than the caller's.
+        return True
+
     def _reconnect_loop(self) -> None:
+        beat = 0
         while not self._stop.wait(RECONNECT_SECONDS):
-            if not self._physical_connected:
-                self._try_physical_open()
+            beat += 1
+            try:
+                if self._physical_connected:
+                    self._probe_physical(deep=beat % DEEP_PROBE_EVERY == 0)
+                else:
+                    self._try_physical_open()
+            except Exception:
+                # This thread is the only thing that can bring the deck back,
+                # so it has to outlive whatever the device does mid-reattach.
+                # Dying here used to strand the deck on its power-on logo
+                # until the daemon was restarted.
+                logger.warning("stream deck reconnect beat failed", exc_info=True)
+
+    def _probe_physical(self, *, deep: bool) -> None:
+        """Notice a deck that left without a failed write to announce it.
+
+        Writes are the only other way we find out, and ``write`` is called
+        only for keys whose content actually changed -- so a deck whose panes
+        are all idle is never written to and never found to be missing.
+        """
+        if self.physical.alive(deep=deep):
+            return
+        with self._lock:
+            self._physical_connected = False
+            self._physical_frames.clear()
+        logger.warning("physical deck went away quietly; will try to reattach")
 
     def _try_physical_open(self) -> None:
         try:

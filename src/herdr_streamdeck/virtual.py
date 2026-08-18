@@ -164,6 +164,10 @@ class VirtualSurface:
     def reopen(self) -> bool:
         return self.connected
 
+    def alive(self, *, deep: bool = False) -> bool:
+        # Nothing to lose track of: the surface is this process.
+        return self.connected
+
     def set_press_handler(self, handler: PressHandler | None) -> None:
         self._handler = handler
 

@@ -43,6 +43,13 @@ class GroupingMode(StrEnum):
     TAB = "tab"
     """Each column is a tab of one workspace; rows are its panes."""
 
+    AGENT = "agent"
+    """No columns at all: the busiest agents, laid out row-major.
+
+    Grouping by workspace spends a whole column on a workspace holding one
+    pane, so a deck of five columns showed five agents out of twelve. This
+    mode drops the grouping and fills keys left-to-right instead."""
+
 
 BADGE_LENGTH = 8
 """Characters a badge can show.
@@ -52,6 +59,17 @@ font there are 56px of usable width, and eight characters of realistic text
 come in under that (``ENG-4521`` is 50.6px, ``refactor`` 39.3px). Strings of
 uniformly wide glyphs (``mmmmmmmm``, 77.9px) still overflow and fall back to
 the renderer's ellipsis, which is an acceptable edge for pane names."""
+
+_WORKSPACE_ID = re.compile(r"^w([0-9A-Fa-f]+)$")
+"""herdr's workspace ids: `w` and a hexadecimal counter -- w9, wA, wB, wC."""
+
+_SPINNER = re.compile(r"^[\s\u2000-\u3000\u25a0-\u25ff\u2700-\u27bf\u2800-\u28ff*]+")
+"""Leading spinner glyphs an agent writes into its terminal title.
+
+herdr's ``terminal_title_stripped`` removes the marks it knows about, but not
+all of them -- Claude Code cycles a quarter-circle glyph that arrives intact.
+Left in they are worse than ugly: the glyph changes frame to frame, so the
+title changes with it, and every frame re-renders and rewrites the key."""
 
 _TICKET = re.compile(r"^[A-Za-z]{3}-(\d+)(?:-(.+))?$")
 """A ticket-style name: three letters, a hyphen, a number, optionally more."""
@@ -113,6 +131,16 @@ class Pane:
     agent: str = ""
     display_agent: str = ""
     status: str = "unknown"
+    cwd: str = ""
+    state_change_seq: int = 0
+    """herdr's server-wide counter as of this agent's last status change.
+
+    The closest thing the protocol has to "when did this last do something":
+    there are no timestamps on any record. It is global rather than per-agent
+    -- a pane with `revision` 7 carries seq 143, and a pane cannot have changed
+    state more often than it has been revised -- so comparing it across panes
+    orders them by recency of activity. It reaches us only through the
+    snapshot's `agents` listing; `pane.list` omits it."""
 
     @classmethod
     def from_record(cls, record: JSONObject) -> Pane | None:
@@ -124,6 +152,10 @@ class Pane:
             value = record.get(key)
             return value if isinstance(value, str) else ""
 
+        def number(key: str) -> int:
+            value = record.get(key)
+            return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
         return cls(
             pane_id=pane_id,
             workspace_id=text("workspace_id"),
@@ -134,10 +166,14 @@ class Pane:
             # `terminal_title` reads "✳ orchestrator", and that leading
             # mark is both redundant with the one we draw and wide enough to
             # cost two of the eight badge characters.
-            terminal_title=text("terminal_title_stripped") or text("terminal_title"),
+            terminal_title=_SPINNER.sub(
+                "", text("terminal_title_stripped") or text("terminal_title")
+            ).strip(),
             agent=text("agent"),
             display_agent=text("display_agent"),
             status=text("agent_status") or "unknown",
+            cwd=text("cwd"),
+            state_change_seq=number("state_change_seq"),
         )
 
     @property
@@ -149,6 +185,39 @@ class Pane:
         agent herdr cannot detect -- qwencode, say -- still gets its own mark.
         """
         return self.display_agent or self.agent
+
+    @property
+    def given_name(self) -> str:
+        """The name a person chose for this pane, or empty if nobody has.
+
+        Distinct from ``badge``: this is only the deliberate name, never the
+        terminal title. A pane the user bothered to rename is telling us what
+        that pane is *for*, which outranks anything we or the agent infer.
+
+        At protocol 19 ``pane.list`` carries no ``title`` key at all and
+        ``label`` only on panes that have been renamed, so this is empty far
+        more often than not. That is the expected shape, not a fault.
+        """
+        return (self.title or self.label).strip()
+
+    @property
+    def creation_key(self) -> tuple[int, str]:
+        """Sort key placing older panes before newer ones.
+
+        herdr hands out workspace ids sequentially, so `w1` predates `wC`, and
+        the numeric part of the id is the only creation-order signal the
+        protocol carries -- no record on any method has a timestamp. Sorting on
+        it rather than on `workspace.number` is deliberate: `number` follows
+        sidebar *position*, so dragging a workspace would reshuffle the deck
+        and "oldest" would quietly stop meaning oldest.
+
+        Ids are documented as opaque, so this reads them defensively: anything
+        that does not parse sorts last, by id, rather than raising.
+        """
+        digits = _WORKSPACE_ID.match(self.workspace_id)
+        if digits is None:
+            return (1 << 30, self.workspace_id)
+        return (int(digits.group(1), 16), self.pane_id)
 
     @property
     def badge(self) -> str:
@@ -268,4 +337,52 @@ def build_columns(
     if truncated:
         logger.info("showing only the first %d panes of: %s", grid.rows, ", ".join(truncated))
 
+    return columns
+
+
+AGENT_KEY_LIMIT = 10
+"""How many agents the flat layout shows.
+
+Two full rows of a 3x5 deck, leaving the bottom row for action keys. Not a
+technical ceiling -- the grid would hold fifteen -- but the point of the row is
+that it stays free."""
+
+
+def build_agent_columns(
+    panes: Sequence[Pane],
+    grid: Grid,
+    limit: int = AGENT_KEY_LIMIT,
+) -> list[Group | None]:
+    """The most recently active agents, oldest first, filled row-major.
+
+    Two different orderings, doing two different jobs. *Which* agents make the
+    cut is recency -- the ones that did something most recently are the ones
+    worth a key. *Where* they sit is creation order, oldest first, because a
+    deck whose keys reshuffle every time an agent speaks is unusable: you
+    reach for position, and position has to hold still while you do.
+
+    Returns the same column structure the grouped modes return, so key lookup
+    and drawing are shared. Each column here is a slice of the flat run rather
+    than a workspace: with five columns, keys 0 and 5 are column 0's two rows.
+    """
+    capacity = min(limit, grid.key_count)
+    # Ties on seq keep herdr's own pane order, which `sorted` guarantees.
+    ranked = sorted(panes, key=lambda pane: pane.state_change_seq, reverse=True)
+    shown = sorted(ranked[:capacity], key=lambda pane: pane.creation_key)
+
+    dropped = len(panes) - len(shown)
+    if dropped > 0:
+        logger.info(
+            "%d agent(s) beyond the %d most recent are not shown: %s",
+            dropped,
+            capacity,
+            ", ".join(pane.pane_id for pane in ranked[capacity:]),
+        )
+
+    columns: list[Group | None] = [None] * grid.columns
+    for position in range(grid.columns):
+        members = tuple(shown[position :: grid.columns])
+        columns[position] = (
+            Group(id=f"agents:{position}", label="", panes=members) if members else None
+        )
     return columns

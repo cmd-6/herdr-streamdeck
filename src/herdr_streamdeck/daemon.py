@@ -38,7 +38,7 @@ import signal
 import subprocess
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Protocol
 
 from .actions import DeckAction, default_config_path, load_actions, open_action
@@ -56,7 +56,16 @@ from .deck import (
 )
 from .icons import mark_for, resolve_override
 from .instance import AlreadyRunning, SingleInstance, lock_path, stop_running
-from .layout import Grid, Group, GroupingMode, GroupKey, Pane, build_columns
+from .layout import (
+    AGENT_KEY_LIMIT,
+    Grid,
+    Group,
+    GroupingMode,
+    GroupKey,
+    Pane,
+    build_agent_columns,
+    build_columns,
+)
 from .lock import POLL_SECONDS, LockWatcher, NoLock, lock_watcher
 from .protocol import Event, HerdrError, JSONObject, subscription
 from .summary import PaneSummary, Reply, Summariser
@@ -80,13 +89,14 @@ STRUCTURAL_EVENTS = frozenset(
         "workspace.created",
         "workspace.closed",
         "workspace.moved",
+        "workspace.renamed",
         "workspace.reordered",
         "workspace.focused",
         "layout.updated",
     }
 )
 
-OPTIONAL_SUBSCRIPTIONS = ("workspace.reordered",)
+OPTIONAL_SUBSCRIPTIONS = ("workspace.reordered", "workspace.renamed")
 """Structural kinds that older servers reject outright.
 
 herdr validates ``events.subscribe`` as a whole: one unrecognised kind fails
@@ -99,6 +109,12 @@ HerdrSession.supports_subscription.
 Version numbers are no help here: ``workspace.reordered`` was added while
 PROTOCOL_VERSION was already 18 and shipped in 19, so the number does not
 say whether a given server has it. Asking does.
+
+``workspace.renamed`` is probed the same way for the same reason. It matters
+because a space's name is what its keys are called: without it a rename waits
+for the 60-second reconcile, which is exactly the delay that made a renamed
+space look broken. It is classified structural so the rename triggers a re-read
+of ``workspace.list``, which is where the new label lives.
 
 It accompanies ``workspace.move_block``, herdr 0.8.0's atomic worktree-group
 reorder and what a sidebar drag uses for a workspace inside a worktree group.
@@ -181,6 +197,18 @@ RECONNECT_SECONDS = 3.0
 
 Frequent enough that plugging it back in feels immediate, sparse enough that an
 absent deck costs nothing -- enumeration is the only work, and it is cheap."""
+
+HEARTBEAT_SECONDS = 5.0
+"""How often to ask a deck we believe in whether it is still there.
+
+Every other route to that answer costs a write, and ``tick`` writes only keys
+whose level changed -- so a deck showing nothing but idle panes is never
+written to, and an undock would otherwise go unnoticed until some key happened
+to change. The probe itself is a locked attribute read; five seconds of it is
+free next to a single key write."""
+
+DEEP_PROBE_EVERY = 3
+"""Beats between the pricier probe that re-enumerates the USB bus."""
 
 ANIMATION_FPS = 20
 """Frame rate for pulsing and blinking.
@@ -320,8 +348,9 @@ class DeckController:
         client: HerdrLike,
         surface: ButtonSurface,
         *,
-        mode: GroupingMode = GroupingMode.WORKSPACE,
+        mode: GroupingMode = GroupingMode.AGENT,
         reconcile_interval: float = 60.0,
+        agent_limit: int = AGENT_KEY_LIMIT,
         summariser: Summariser | None = None,
         lock: LockWatcher | None = None,
         lock_interval: float = POLL_SECONDS,
@@ -345,12 +374,16 @@ class DeckController:
         self._working_summary_inputs: dict[str, str] = {}
         self._working_summary_interval = working_summary_interval
         self._reconcile_interval = reconcile_interval
+        self._agent_limit = agent_limit
         # Insertion order matters: it is herdr's pane order, and sorting it
         # would replace herdr's arrangement with ours.
         self._panes: dict[str, Pane] = {}
         self._order: list[GroupKey] = []
         self._columns: list[Group | None] = []
         self._focused_workspace = ""
+        # workspace_id -> label, kept for every mode: the name a person gave a
+        # space is what its keys are called, whether or not columns are spaces.
+        self._workspace_labels: dict[str, str] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._dirty = asyncio.Event()
         self._restructure = False
@@ -370,9 +403,9 @@ class DeckController:
         self._connected = True
         self._reconnect_task: asyncio.Task[None] | None = None
         # Resolved once against the running server, which cannot change
-        # version underneath a live connection.
-        self._optional_subscriptions = True
-        self._optional_checked = False
+        # version underneath a live connection. None until asked; then the
+        # subset of OPTIONAL_SUBSCRIPTIONS this server actually recognises.
+        self._optional_supported: frozenset[str] | None = None
 
     @property
     def grid(self) -> Grid:
@@ -386,10 +419,28 @@ class DeckController:
         if pane is None:
             return False
         existing = self._panes.get(pane.pane_id)
+        if existing is not None and not pane.state_change_seq:
+            # Only the snapshot's `agents` listing carries state_change_seq;
+            # `pane.list` and every `pane.updated` payload omit it. Letting a
+            # cosmetic update zero it would drop that pane to the back of the
+            # recency ranking and shuffle the deck under your hand.
+            pane = replace(pane, state_change_seq=existing.state_change_seq)
         if existing == pane:
             return False
         self._panes[pane.pane_id] = pane
         return True
+
+    def _mark_active(self, pane_id: str) -> int:
+        """Stamp a pane as the most recently active one.
+
+        herdr only reports state_change_seq in a snapshot, so between the
+        60-second reconciles the ranking would freeze and a just-woken agent
+        would not climb into the visible ten until the next one. Continuing
+        herdr's own counter locally keeps that live, and the next reconcile
+        overwrites it with the server's authoritative value.
+        """
+        highest = max((pane.state_change_seq for pane in self._panes.values()), default=0)
+        return highest + 1
 
     def _remove(self, pane_id: str) -> bool:
         self._cancel_summary(pane_id)
@@ -402,8 +453,12 @@ class DeckController:
 
     def _rebuild_columns(self) -> None:
         """Recompute columns from the current model, preserving herdr's order."""
+        panes = list(self._panes.values())
+        if self._mode is GroupingMode.AGENT:
+            self._columns = build_agent_columns(panes, self.grid, self._agent_limit)
+            return
         self._columns = build_columns(
-            list(self._panes.values()),
+            panes,
             self._order,
             self.grid,
             self._mode,
@@ -412,11 +467,59 @@ class DeckController:
 
     # ------------------------------------------------------------------ drawing
 
+    def deliberate_space_name(self, pane: Pane) -> str:
+        """The space's name, if a person chose it, otherwise empty.
+
+        Renaming a space in herdr's sidebar is the rename people actually
+        perform -- it is the one the UI offers -- and it writes
+        ``workspace.label``. But that field is not blank by default: herdr
+        seeds it with the checkout's directory name, so six spaces opened on
+        the same repo all read ``v2-dos``, which identifies nothing. Taking the
+        label unconditionally would replace nine useful auto-titles with nine
+        copies of a repo name.
+
+        A rename is detectable precisely because it stops matching the
+        directory. Measured across a twelve-space session, this picks out
+        exactly the three spaces that were renamed by hand and rejects all
+        nine repo-derived ones.
+        """
+        label = self._workspace_labels.get(pane.workspace_id, "").strip()
+        if not label or not pane.cwd:
+            return ""
+        return "" if label == PurePath(pane.cwd).name else label
+
+    def name_for(self, pane: Pane) -> str:
+        """What a key calls its pane, most deliberate name first.
+
+        A name someone chose says what the pane is *for*, and nothing inferred
+        beats it, so it holds even while the agent works and the model never
+        displaces it. The space name leads because renaming a space is the
+        gesture herdr's sidebar actually offers; ``pane.rename`` exists but is
+        a different, rarely-used command, and having it outrank the sidebar
+        meant a space you had just renamed kept showing an old pane label.
+        Failing both, the model's title says what the pane is doing right now,
+        and failing that the terminal title -- whatever the agent last wrote,
+        usually serviceable and always better than a blank key.
+        """
+        summary = self._summaries.get(pane.pane_id)
+        return (
+            self.deliberate_space_name(pane)
+            or pane.given_name
+            or (summary.display if summary else "")
+            or pane.terminal_title
+        )
+
     def face_for(self, pane: Pane | None) -> ButtonFace:
-        """The face for one key."""
+        """The face for one key: the name in the body, the mark in a corner.
+
+        Weighted this way because every key in a column carries the *same*
+        agent glyph, so between them the glyph distinguishes nothing, while the
+        name is the only thing that says which pane this is. The mark keeps a
+        chip in the top-left, which is enough to tell agents apart in a column
+        that mixes them.
+        """
         if pane is None:
             return ButtonFace(background=EMPTY_BACKGROUND)
-        summary = self._summaries.get(pane.pane_id)
         mark = mark_for(pane.mark_key)
         return ButtonFace(
             mark=mark.glyph,
@@ -424,8 +527,8 @@ class DeckController:
             mark_scale=mark.scale,
             # A user PNG in the plugin config dir replaces the glyph.
             icon=resolve_override(pane.mark_key),
-            badge=pane.badge,
-            summary=summary.display if summary else "",
+            title=self.name_for(pane),
+            title_style=True,
             status_color=STATUS_COLORS.get(pane.status),
         )
 
@@ -621,6 +724,31 @@ class DeckController:
             return
         if self._reconnect_task is None or self._reconnect_task.done():
             self._reconnect_task = asyncio.create_task(self._reconnect_loop(), name="reconnect")
+
+    async def _heartbeat_loop(self) -> None:
+        """Ask the deck whether it is still there, since nothing else will.
+
+        A disconnect is otherwise discovered only by a write failing, and an
+        idle deck is written to never: dock and undock while every pane is
+        quiet and the deck comes back on its power-on logo, with the daemon
+        still believing it drew the right thing. Probing costs a locked
+        attribute read, so this can run far more often than it needs to.
+        """
+        beat = 0
+        while True:
+            await asyncio.sleep(HEARTBEAT_SECONDS)
+            if not self._connected:
+                # Already known to be gone; _reconnect_loop owns it from here.
+                continue
+            beat += 1
+            try:
+                alive = self._surface.alive(deep=beat % DEEP_PROBE_EVERY == 0)
+            except Exception:
+                logger.debug("heartbeat probe failed", exc_info=True)
+                continue
+            if not alive:
+                logger.warning("deck went away quietly; noticed by heartbeat")
+                self._note_disconnect()
 
     async def _reconnect_loop(self) -> None:
         """Watch for the deck coming back, and redraw it when it does."""
@@ -956,8 +1084,11 @@ class DeckController:
                     continue
                 if item.get("focused"):
                     focused = ws_id
+                label = item.get("label")
+                # Collected in every mode, not just WORKSPACE: the space's name
+                # names its keys even when columns are not spaces.
+                self._workspace_labels[ws_id] = label if isinstance(label, str) else ""
                 if self._mode is GroupingMode.WORKSPACE:
-                    label = item.get("label")
                     order.append(
                         GroupKey(id=ws_id, label=label if isinstance(label, str) else ws_id)
                     )
@@ -980,9 +1111,14 @@ class DeckController:
 
         return order, focused
 
-    def _subscription_set(self, *, optional: bool = True) -> list[JSONObject]:
-        """Global subscriptions plus one status subscription per live pane."""
-        kinds = (*SUBSCRIPTIONS, *OPTIONAL_SUBSCRIPTIONS) if optional else SUBSCRIPTIONS
+    def _subscription_set(self, optional: frozenset[str] | None = None) -> list[JSONObject]:
+        """Global subscriptions plus one status subscription per live pane.
+
+        ``optional`` is the subset of OPTIONAL_SUBSCRIPTIONS to include; None
+        means all of them, which is the right assumption before asking.
+        """
+        extra = OPTIONAL_SUBSCRIPTIONS if optional is None else optional
+        kinds = (*SUBSCRIPTIONS, *(k for k in OPTIONAL_SUBSCRIPTIONS if k in extra))
         subs = [subscription(kind) for kind in kinds]
         subs.extend(
             subscription("pane.agent_status_changed", pane_id=pane_id)
@@ -1000,19 +1136,24 @@ class DeckController:
         so there is nothing left to retry on. See
         HerdrSession.supports_subscription.
         """
-        if self._optional_subscriptions and not self._optional_checked:
-            self._optional_checked = True
+        if self._optional_supported is None:
+            supported: set[str] = set()
             for kind in OPTIONAL_SUBSCRIPTIONS:
-                if not await self._client.supports_subscription(kind):
-                    self._optional_subscriptions = False
+                # Each kind is asked about separately. They shipped in
+                # different herdr releases, so one being unknown says nothing
+                # about the other -- treating them as a single yes/no dropped
+                # both whenever the older server lacked either.
+                if await self._client.supports_subscription(kind):
+                    supported.add(kind)
+                else:
                     logger.info(
-                        "this herdr does not know %s, so it is left out. "
-                        "Workspace reordering will reach the deck on the next "
+                        "this herdr does not know %s, so it is left out; "
+                        "what it reports will reach the deck on the next "
                         "reconcile rather than at once",
                         kind,
                     )
-                    break
-        await send(self._subscription_set(optional=self._optional_subscriptions))
+            self._optional_supported = frozenset(supported)
+        await send(self._subscription_set(self._optional_supported))
 
     async def run_subscriptions(self) -> None:
         """Establish the initial subscription set (globals plus per pane)."""
@@ -1064,7 +1205,11 @@ class DeckController:
                 if existing is not None and existing.status != status:
                     self._cancel_summary(pane_id)
                     self._working_summary_inputs.pop(pane_id, None)
-                    self._panes[pane_id] = replace(existing, status=status)
+                    self._panes[pane_id] = replace(
+                        existing,
+                        status=status,
+                        state_change_seq=self._mark_active(pane_id),
+                    )
                     if status == "working":
                         # Only now is the summary out of date. It used to be
                         # cleared on every transition, which meant glancing at
@@ -1114,6 +1259,7 @@ class DeckController:
         animator = asyncio.create_task(self._animate_loop(), name="animator")
         reconciler = asyncio.create_task(self._reconcile_loop(), name="reconciler")
         locker = asyncio.create_task(self._lock_loop(), name="locker")
+        heartbeat = asyncio.create_task(self._heartbeat_loop(), name="heartbeat")
         working_summaries = (
             asyncio.create_task(self._working_summary_loop(), name="working-summaries")
             if self._summariser is not None and self._working_summary_interval > 0
@@ -1136,6 +1282,7 @@ class DeckController:
                 animator,
                 reconciler,
                 locker,
+                heartbeat,
                 working_summaries,
                 self._reconnect_task,
                 *self._summary_tasks.values(),
@@ -1212,10 +1359,17 @@ def _iter_panes(snapshot: JSONObject) -> list[JSONObject]:
         if isinstance(node, dict):
             pane_id = node.get("pane_id")
             if isinstance(pane_id, str) and "terminal_id" in node:
-                # Prefer the richer record when the same pane appears twice.
+                # Merge rather than pick a winner. The two listings carry
+                # *different* fields, not more and less of the same: only
+                # `agents` has state_change_seq, only `panes` has scroll, and
+                # at protocol 19 both records are exactly fourteen keys wide --
+                # so choosing by size silently dropped whichever arrived
+                # second, and which one that is depends on key order.
                 existing = found.get(pane_id)
-                if existing is None or len(node) > len(existing):
-                    found[pane_id] = node
+                if existing is None:
+                    found[pane_id] = dict(node)
+                else:
+                    existing.update({k: v for k, v in node.items() if v is not None})
             for value in node.values():
                 walk(value)
         elif isinstance(node, list):
@@ -1331,6 +1485,7 @@ async def amain(argv: list[str] | None = None) -> int:
         client,
         surface,
         mode=GroupingMode(args.mode),
+        agent_limit=args.agent_limit,
         summariser=summariser,
         lock=lock_watcher(enabled=not args.no_screen_lock),
         activate=(
@@ -1386,10 +1541,23 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--mode",
         choices=[m.value for m in GroupingMode],
-        default=GroupingMode.WORKSPACE.value,
+        default=GroupingMode.AGENT.value,
         help=(
-            "what a column represents: 'workspace' (sidebar order) or 'tab' "
-            "(tabs of the focused workspace). Default: workspace"
+            "what the keys show: 'agent' (the most recently active agents, "
+            "oldest first, ignoring workspaces), 'workspace' (a column per "
+            "workspace, in sidebar order) or 'tab' (a column per tab of the "
+            "focused workspace). Default: agent"
+        ),
+    )
+    parser.add_argument(
+        "--agent-limit",
+        type=int,
+        default=AGENT_KEY_LIMIT,
+        metavar="N",
+        help=(
+            f"how many agents the 'agent' layout shows (default: "
+            f"{AGENT_KEY_LIMIT}, two rows of a 3x5 deck, leaving the bottom "
+            "row for action keys)"
         ),
     )
     parser.add_argument(

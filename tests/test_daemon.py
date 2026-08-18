@@ -796,7 +796,13 @@ def test_working_label_keeps_the_words_that_distinguish_similar_tasks(
     assert working_label(title) == expected
 
 
-async def test_working_progress_is_refreshed_from_the_live_transcript() -> None:
+async def test_a_name_holds_still_while_the_agent_works() -> None:
+    """The complaint this replaces: keys rewording themselves as work went on.
+
+    A thread's name says what it is for, and that does not change because the
+    agent moved on to the next file -- so an unchanged task must not cost a
+    model call, let alone a new set of words.
+    """
     calls: list[str] = []
     controller, surface, _ = make_controller(
         snapshot={
@@ -812,20 +818,59 @@ async def test_working_progress_is_refreshed_from_the_live_transcript() -> None:
     controller._summariser = summariser_returning(SUMMARY, calls)
     await controller.prime()
 
-    controller._refresh_working_summaries()
+    controller._resummarise_if_the_task_changed()
     await asyncio.sleep(0)
     await asyncio.sleep(0)
     controller.repaint()
 
-    assert calls == ["agent output"]
-    assert surface.faces[0].title == "remove or deprecate"
+    named = surface.faces[0].title
+    assert named == "remove or deprecate", "the model's name should replace the stand-in"
     assert controller.replies_for("w1:p1") == (), "busy agents must not offer replies"
 
-    controller._refresh_working_summaries()
+    for _ in range(3):
+        controller._resummarise_if_the_task_changed()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+    controller.repaint()
+
+    assert calls == ["agent output"], "an unchanged task must not spend another call"
+    assert surface.faces[0].title == named, "the name moved while the task did not"
+
+
+async def test_a_new_task_earns_a_new_name() -> None:
+    """The counterpart: give the thread a different job and it renames."""
+    calls: list[str] = []
+    controller, _, _ = make_controller(
+        snapshot={
+            "panes": [
+                pane_record(
+                    "w1:p1",
+                    agent_status="working",
+                    terminal_title_stripped="Review PR #9139",
+                )
+            ]
+        }
+    )
+    controller._summariser = summariser_returning(SUMMARY, calls)
+    await controller.prime()
+    controller._resummarise_if_the_task_changed()
     await asyncio.sleep(0)
     await asyncio.sleep(0)
 
-    assert calls == ["agent output"], "unchanged output must not spend another model call"
+    controller.handle(
+        updated(
+            pane_record(
+                "w1:p1",
+                agent_status="working",
+                terminal_title_stripped="Migrate auth module off sessions",
+            )
+        )
+    )
+    controller._resummarise_if_the_task_changed()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert len(calls) == 2, "a changed task should have been re-read"
 
 
 async def test_finishing_cancels_stale_progress_before_summarising_the_result() -> None:
@@ -850,7 +895,7 @@ async def test_finishing_cancels_stale_progress_before_summarising_the_result() 
         transport=lambda body, timeout: b"transport is not reached"
     )
     await controller.prime()
-    controller._refresh_working_summaries()
+    controller._resummarise_if_the_task_changed()
     await started.wait()
 
     controller.handle(status_changed("w1:p1", "idle"))
@@ -858,7 +903,7 @@ async def test_finishing_cancels_stale_progress_before_summarising_the_result() 
     await asyncio.sleep(0)
     controller.repaint()
 
-    assert surface.faces[0].title == "review finished"
+    assert surface.faces[0].title != "stale progress", "the abandoned read still landed"
 
 
 async def test_finishing_a_turn_is_summarised() -> None:
@@ -900,9 +945,14 @@ def test_which_transitions_are_worth_a_model_call(
     assert worth_summarising(before, after) is expected
 
 
-async def test_a_new_status_drops_the_old_summary_immediately() -> None:
-    """The words described the previous state, so leaving them up is worse than
-    showing nothing -- the key would assert something no longer true."""
+async def test_a_new_status_keeps_the_name_and_drops_the_replies() -> None:
+    """A status change is not a task change.
+
+    The name says what the thread is for, which starting work again does not
+    alter -- so it stays. The replies answered a message that has now been
+    answered, so they go: offering them again would send a second reply to a
+    question nobody is asking.
+    """
     calls: list[str] = []
     controller, surface, _ = make_controller(snapshot={"panes": [pane_record("w1:p1")]})
     controller._summariser = summariser_returning(SUMMARY, calls)
@@ -912,11 +962,16 @@ async def test_a_new_status_drops_the_old_summary_immediately() -> None:
     await asyncio.sleep(0)
     await asyncio.sleep(0)
     controller.repaint()
-    assert surface.faces[0].title
+    named = surface.faces[0].title
+    assert named
 
     controller.handle(status_changed("w1:p1", "working"))
     controller.repaint()
-    assert surface.faces[0].title == ""
+    # The trailing question mark is `waiting` rendered, not part of the name,
+    # so it correctly goes when the agent stops waiting on an answer.
+    assert named.endswith("?")
+    assert surface.faces[0].title == named.removesuffix("?")
+    assert controller.replies_for("w1:p1") == ()
 
 
 async def test_a_name_you_chose_outranks_the_model_title() -> None:
@@ -1217,12 +1272,15 @@ async def test_a_summary_survives_a_status_change_that_is_not_work() -> None:
     assert surface.faces[0].title == SHOWN
 
 
-async def test_a_summary_is_cleared_when_the_agent_starts_working() -> None:
-    """Then, and only then, it describes something that is no longer true."""
+async def test_the_name_survives_the_agent_starting_work_again() -> None:
+    """It described the task, not the moment, so it is still true."""
     controller, surface, _ = await menued()
+    controller.repaint()
+    before = surface.faces[0].title
+    assert before, "nothing was drawn to survive"
     controller.handle(status_changed("w1:p1", "working"))
     controller.repaint()
-    assert surface.faces[0].title == ""
+    assert surface.faces[0].title == before.removesuffix("?"), "the name changed"
 
 
 # ------------------------------------------------------------- disconnection

@@ -57,7 +57,9 @@ SCHEMA: dict[str, Any] = {
         "summary": {
             "type": "string",
             "description": (
-                "4-6 short words, at most 42 characters including spaces. "
+                "The thread's standing task, in 4-6 short words, at most 42 "
+                "characters including spaces. What it is FOR, not where it "
+                "has got to. "
                 "When the agent offers alternatives, name them: "
                 "'remove or deprecate?', not 'endpoint deprecation'."
             ),
@@ -81,7 +83,7 @@ SCHEMA: dict[str, Any] = {
 }
 
 SHAPE = """Return ONLY this JSON object, with every field present and no extra fields:
-{"waiting": <true|false>, "summary": "<4-6 short words>",
+{"waiting": <true|false>, "summary": "<the thread's task, 4-6 short words>",
  "responses": [{"kind": "affirmative"|"negative"|"proceed"|"alternative",
                 "label": "<1-3 words>", "text": "<full reply>"}]}
 `waiting` is required and must always be present. Every response object must have
@@ -90,10 +92,25 @@ all three of kind, label and text."""
 
 
 SYSTEM_PROMPT = (
-    """You are summarising a response from a coding agent in 4-6
-words, and generating a few possible short replies. The goal is to convey the
-agent's intent or question in few enough characters to display legibly on a
-small key.
+    """You are naming what a coding agent's thread is working on, in 4-6 words,
+and generating a few possible short replies. The name goes on a physical key
+that the user glances at to find the right thread among a dozen of them.
+
+Name the standing task, not the current step. The thread's task is the thing
+that was asked of it, and it stays the same from the first message to the last;
+what the agent happens to be doing this minute is not it. Write the name so
+that it is equally true when the work starts, while it runs, and once it is
+finished -- if it would need rewriting a minute from now, it is wrong.
+  agent is running the test suite, part-way through migrating the auth module
+      GOOD  Migrate auth module off sessions
+      BAD   Running tests
+      BAD   Tests passed, fixing lint
+  agent has just finished reviewing a PR and is writing up findings
+      GOOD  Review user msg attribution PR
+      BAD   Writing up review findings
+The user already knows from the key's own colour whether a thread is busy,
+finished or waiting on them, so words spent on that say nothing they cannot
+already see.
 
 The words appear on a physical Stream Deck key: a 72x72 pixel square. Only about
 17 characters fit on a line and four lines fit, so prefer short common words. A
@@ -183,6 +200,22 @@ class PaneSummary:
     waiting: bool
     replies: tuple[Reply, ...] = ()
     """Suggested one-tap replies. Answers when `waiting`, next steps otherwise."""
+
+    provisional: bool = False
+    """True for the model-free stand-in shown until a real name arrives.
+
+    A stand-in describes the same task as the name that will replace it, so
+    "keep the name while the task is unchanged" would otherwise pin the crude
+    version permanently and throw the model's away."""
+
+    subject: str = ""
+    """The terminal title this phrase was written for.
+
+    A thread's name should hold still while the agent works, so the phrase is
+    kept until the *task* changes rather than refreshed whenever the activity
+    does. This records which task it describes, so a change can be told from a
+    mere status flip. Replies carry no such thing: they answer the latest
+    message and are meant to be replaced."""
 
     @property
     def display(self) -> str:

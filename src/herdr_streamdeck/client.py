@@ -35,6 +35,8 @@ from .protocol import (
 )
 
 DEFAULT_EVENT_QUEUE_SIZE = 1024
+MAX_MESSAGE_BYTES = 1024 * 1024
+"""Bound NDJSON messages while allowing snapshots with many active panes."""
 
 
 def default_socket_path() -> Path:
@@ -122,7 +124,9 @@ class HerdrClient:
                 f"socket path is {len(encoded)} bytes, over this platform's "
                 f"{limit}-byte AF_UNIX limit: {self.socket_path}"
             )
-        self._reader, self._writer = await asyncio.open_unix_connection(str(self.socket_path))
+        self._reader, self._writer = await asyncio.open_unix_connection(
+            str(self.socket_path), limit=MAX_MESSAGE_BYTES
+        )
         self._closed.clear()
         self._reader_task = asyncio.create_task(self._read_loop(), name="herdr-reader")
 

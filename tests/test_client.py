@@ -90,6 +90,19 @@ async def test_request_returns_result(
         assert (await client.ping())["protocol"] == 17
 
 
+async def test_snapshot_can_exceed_the_default_stream_reader_limit(
+    server: Callable[[Handler], Awaitable[Path]],
+) -> None:
+    title = "review details " * 5_000
+
+    async def handler(request: JSONObject) -> list[JSONObject]:
+        return [{"id": request["id"], "result": {"terminal_title": title}}]
+
+    path = await server(handler)
+    async with HerdrClient(path) as client:
+        assert (await client.snapshot())["terminal_title"] == title
+
+
 async def test_request_raises_herdr_error(
     server: Callable[[Handler], Awaitable[Path]],
 ) -> None:
